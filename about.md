@@ -1,30 +1,29 @@
-# Editor AI
+# Editor AI — 한국어 안내
 
-Describe a level in plain words and watch it get built for you. EditorAI talks to the AI of your choice, then places the result in the editor on its own <cb>preview layer</c> you can accept, edit, or deny — your level, your call, always.
+원하는 레벨을 문장으로 설명하면 EditorAI가 선택한 AI 모델을 이용해 레벨을 생성합니다. 결과는 별도의 <cb>미리보기 레이어</c>에 배치되며, 사용자가 승인하거나 수정하거나 거부할 수 있습니다.
 
-## Open the panel
+## 패널 열기
 
-Press <cg>E</c> anywhere in the game (desktop — rebindable in Settings), or tap the floating <cg>AI</c> bubble (mobile). Everything lives in that panel: starting generations, watching them run, chatting with the AI, and every setting.
+데스크톱에서는 기본 단축키 <cg>E</c>를 누르세요. 모바일에서는 화면에 표시되는 <cg>AI</c> 버튼을 누르세요. 패널에서 생성 시작, 진행 상황 확인, AI와 대화, 설정 변경을 할 수 있습니다.
 
-## Pick an AI
+## AI 제공자 선택
 
-Open the panel, go to <cy>Settings</c>, and choose a provider. Two are free with zero accounts:
+패널의 <cy>Settings</c>에서 제공자를 선택하세요.
 
-- <cy>Platinum</c> (free, community-run — servers by VLT GG): set provider to <cg>ollama</c> and enable <cg>Use Platinum</c>. Prompts run on volunteer machines, so keep personal info out of them.
-- <cy>Ollama</c> (free, fully local): install Ollama, pull a model, set provider to <cg>ollama</c>. Nothing leaves your machine.
+- <cy>Platinum</c>: 제공자를 <cg>ollama</c>로 설정하고 <cg>Use Platinum</c>을 켭니다. 커뮤니티 운영 서버를 사용하므로 프롬프트에 개인정보를 입력하지 마세요.
+- <cy>Ollama</c>: 모델을 로컬에서 실행합니다. Ollama를 설치하고 모델을 받은 뒤 제공자를 <cg>ollama</c>로 설정하세요.
+- Gemini, Claude, OpenAI 등 호스팅 서비스는 해당 서비스의 API 키가 필요할 수 있습니다. OpenRouter와 Hugging Face는 패널의 브라우저 로그인 기능도 지원합니다.
 
-For hosted providers (Claude, OpenAI, Mistral, DeepSeek, Groq, Gemini, and more), paste an API key — or use the <cg>Sign in with browser</c> button for OpenRouter and HuggingFace, no key-copying needed.
+## 사용 방법
 
-## Use it
+1. 패널에서 <cy>Chat</c> → <cg>+ new chat</c>을 선택합니다.
+2. 대상 레벨을 선택합니다. 현재 편집 중인 레벨, 새 레벨, 기존에 만든 레벨을 선택할 수 있습니다.
+3. 원하는 내용을 입력하고 난이도·스타일·길이를 설정한 뒤 <cg>Generate</c>를 누릅니다.
+4. 생성 과정을 확인합니다. 작업 중 패널이나 편집기를 닫아도 생성이 계속될 수 있습니다.
+5. 결과를 미리보기 레이어에서 확인하고 <cg>Accept</c>, <cy>Edit</c>, <cr>Deny</c> 중 하나를 선택합니다.
+6. 대화를 이어가며 작은 수정, 전체 재작업, 계획, 질문을 요청할 수 있습니다. 대화는 재시작 후에도 유지됩니다.
+7. 생성 결과 평가가 표시되면 평가를 제출할 수 있습니다.
 
-1. Panel → <cy>Chat</c> → <cg>+ new chat</c>
-2. Pick a target: the current editor, a brand-new level, or any of your created levels
-3. Describe what you want, set difficulty/style/length (or type your own), press <cg>Generate</c>
-4. Watch it think and work live — you can close the panel, or even the editor, while it runs
-5. The result appears on its own editor layer (the rest fades back): <cg>Accept</c>, <cy>Edit</c>, or <cr>Deny</c>
-6. Keep the conversation going for as long as you like — small edits, full reworks, plans, questions. Conversations survive restarts; just send another message
-7. Rate generations when asked — your ratings teach the AI your taste over time
+패널의 각 설정에는 기능을 설명하는 툴팁이 있습니다.
 
-Every option in the panel has a hover tooltip explaining what it does.
-
-Bugs or ideas? Open an issue on the GitHub repository (entity12208/editorai).
+문제 제보와 기능 제안은 GitHub 저장소의 이슈에서 제출할 수 있습니다.
