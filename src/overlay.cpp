@@ -2040,13 +2040,15 @@ void drawOverlay() {
     // mid-attempt is never the moment.
     if (uiMobile() && !PlayLayer::get()) {
         ImGui::SetNextWindowPos(ImVec2(8, 60), ImGuiCond_FirstUseEver);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.f, 12.f));
         if (ImGui::Begin("##eaibubble", nullptr,
                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
                 ImGuiWindowFlags_NoCollapse)) {
-            if (ImGui::Button("AI", ImVec2(44, 44)))
+            if (ImGui::Button("AI", ImVec2(56, 56)))
                 g_st.panelOpen = !g_st.panelOpen;
         }
         ImGui::End();
+        ImGui::PopStyleVar();
     }
 
     // "Go to level" — a finished generation is waiting for its target level.
