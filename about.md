@@ -1,29 +1,29 @@
-# Editor AI — 한국어 안내
+# Editor AI
 
-원하는 레벨을 문장으로 설명하면 EditorAI가 선택한 AI 모델을 이용해 레벨을 생성합니다. 결과는 별도의 <cb>미리보기 레이어</c>에 배치되며, 사용자가 승인하거나 수정하거나 거부할 수 있습니다.
+Describe the level you want in natural language and EditorAI uses your selected AI model to generate it. Results are placed in a separate preview layer, where you can accept, edit, or deny them.
 
-## 패널 열기
+## Opening the panel
 
-데스크톱에서는 기본 단축키 <cg>E</c>를 누르세요. 모바일에서는 화면에 표시되는 <cg>AI</c> 버튼을 누르세요. 패널에서 생성 시작, 진행 상황 확인, AI와 대화, 설정 변경을 할 수 있습니다.
+On desktop, press the default hotkey <cg>E</c>. On mobile, tap the on-screen <cg>AI</c> button. The panel lets you start generation, monitor progress, chat with the AI, and change settings.
 
-## AI 제공자 선택
+## Choosing an AI provider
 
-패널의 <cy>Settings</c>에서 제공자를 선택하세요.
+Open <cy>Settings</c> in the panel and choose a provider.
 
-- <cy>Platinum</c>: 제공자를 <cg>ollama</c>로 설정하고 <cg>Use Platinum</c>을 켭니다. 커뮤니티 운영 서버를 사용하므로 프롬프트에 개인정보를 입력하지 마세요.
-- <cy>Ollama</c>: 모델을 로컬에서 실행합니다. Ollama를 설치하고 모델을 받은 뒤 제공자를 <cg>ollama</c>로 설정하세요.
-- Gemini, Claude, OpenAI 등 호스팅 서비스는 해당 서비스의 API 키가 필요할 수 있습니다. OpenRouter와 Hugging Face는 패널의 브라우저 로그인 기능도 지원합니다.
+- <cy>Platinum</cy>: Set the provider to <cg>ollama</c> and enable <cg>Use Platinum</c>. This uses a community-operated server; do not enter personal information in prompts.
+- <cy>Ollama</c>: Run a model locally. Install Ollama, download a model, then set the provider to <cg>ollama</c>.
+- Hosted services such as Gemini, Claude, and OpenAI may require their own API keys. OpenRouter and Hugging Face also support browser sign-in from the panel.
 
-## 사용 방법
+## Usage
 
-1. 패널에서 <cy>Chat</c> → <cg>+ new chat</c>을 선택합니다.
-2. 대상 레벨을 선택합니다. 현재 편집 중인 레벨, 새 레벨, 기존에 만든 레벨을 선택할 수 있습니다.
-3. 원하는 내용을 입력하고 난이도·스타일·길이를 설정한 뒤 <cg>Generate</c>를 누릅니다.
-4. 생성 과정을 확인합니다. 작업 중 패널이나 편집기를 닫아도 생성이 계속될 수 있습니다.
-5. 결과를 미리보기 레이어에서 확인하고 <cg>Accept</c>, <cy>Edit</c>, <cr>Deny</c> 중 하나를 선택합니다.
-6. 대화를 이어가며 작은 수정, 전체 재작업, 계획, 질문을 요청할 수 있습니다. 대화는 재시작 후에도 유지됩니다.
-7. 생성 결과 평가가 표시되면 평가를 제출할 수 있습니다.
+1. Select <cy>Chat</c> → <cg>+ new chat</c> in the panel.
+2. Choose a target level: the current editor level, a new level, or an existing level.
+3. Enter your prompt, configure difficulty, style, and length, then select <cg>Generate</cg>.
+4. Monitor generation. Work may continue if you close the panel or editor.
+5. Review the result in the preview layer and select <cg>Accept</cg>, <cy>Edit</cy>, or <cr>Deny</cr>.
+6. Continue the conversation to request small changes, a full rewrite, a plan, or answers. Chats persist across restarts.
+7. Submit a rating when prompted.
 
-패널의 각 설정에는 기능을 설명하는 툴팁이 있습니다.
+Each setting has a tooltip explaining its function.
 
-문제 제보와 기능 제안은 GitHub 저장소의 이슈에서 제출할 수 있습니다.
+Report bugs and suggest features through issues in the GitHub repository.
