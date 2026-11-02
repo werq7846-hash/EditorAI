@@ -60,3 +60,55 @@ Join the [HuggingFace org](https://huggingface.co/EditorAI-Geode/) to publish mo
 
 Found a bug or have an idea? [Open an issue](https://github.com/entity12208/editorai/issues) or [fork the repository](https://github.com/entity12208/EditorAI/fork).
 You can also check to see if there is a [fork](https://github.com/entity12208/editorai/forks) where the bug is fixed.
+
+
+### EditorAI (Android64 Fork)
+
+> ⚠️ **This is an unofficial fork.** It is not an official release from, nor endorsed by, the original creator.
+> Original project: https://github.com/Entity12208/EditorAI
+> All credit for the original mod goes to [Entity12208](https://github.com/Entity12208).
+
+## Why this fork exists
+Improves Android64 (arm64-v8a) support for EditorAI: build/CI, mobile networking, touch UI, and stability.
+
+## Based on
+Forked from upstream version/commit: `[vX.X.X / commit hash]`
+
+## Changes from upstream
+- [Replace with your actual changes]
+- [e.g. Added android64 build to CI]
+- [e.g. Added LAN IP guidance and a connection test button for local providers]
+
+## Installation
+[Write the Android64 build and install steps here]
+
+## Known limitations
+- Local providers (Ollama, LM Studio, llama.cpp) require your PC's LAN IP. `localhost` will not work on a phone.
+- [Add other limitations]
+
+## AI-assisted development
+Parts of this fork were written with the help of an AI coding assistant and were reviewed and tested by the maintainer on: `[device / Android version / Geode version]`.
+
+## AI-assisted development and language note
+I am not fluent in English, so I used an AI assistant to help write this README
+and other English text (issues, pull requests, and comments). Please forgive any
+awkward or unnatural phrasing.
+
+Parts of this fork's code were also written with the help of an AI coding assistant.
+All changes were reviewed and tested by the maintainer on:
+`[device / Android version / Geode version]`.
+
+## Reporting issues
+Please report issues with this fork in **this** repository.
+Do not contact the original author about problems in this fork.
+
+## Upstream contribution
+Where possible, changes are offered back to upstream as pull requests.
+
+## Disclaimer
+This fork is provided "as is" without warranty of any kind. Some code was AI-assisted and may contain bugs.
+
+## License
+Same license as upstream (see [LICENSE](./LICENSE)).
+The original copyright notice is preserved.
+
