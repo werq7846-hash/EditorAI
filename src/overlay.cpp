@@ -2064,7 +2064,13 @@ void drawOverlay() {
     editoraiOAuthTick(dt);
     editoraiProbeLocalBackends();   // once — tags local servers in the picker
     g_persistTimer += dt;
-    if (g_persistTimer > 5.f) {
+    // Serializing every session (chat history + transcript tail) happens on
+    // the main thread; during a long stream the dirty flag is set constantly,
+    // so a short interval turns into a periodic hitch. Phones take a longer
+    // interval — a crash costs at most a few extra seconds of a live session,
+    // and Geode flushes on a normal exit anyway.
+    const float persistInterval = uiMobile() ? 15.f : 5.f;
+    if (g_persistTimer > persistInterval) {
         g_persistTimer = 0.f;
         editoraiPersistSessionsIfDirty();
     }
