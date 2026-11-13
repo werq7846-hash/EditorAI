@@ -9986,14 +9986,28 @@ void editoraiPersistSessionsIfDirty() {
         o["fbDifficulty"]        = s->fbDifficulty;
         o["fbStyle"]             = s->fbStyle;
         o["fbLength"]            = s->fbLength;
-        o["fbObjectsJson"]       = s->fbObjectsJson;
-        o["fbEditedObjectsJson"] = s->fbEditedObjectsJson;
+        // The object payloads are only needed to rate a generation. Persisting
+        // them for every finished session turns sessions.json into tens of MB
+        // with large levels, which is slow to parse at startup — a real
+        // problem on Android. Keep them only while a rating is still pending;
+        // rating/share reads the in-memory copy before this point.
+        const bool keepObjectPayload = s->needsRating;
+        o["fbObjectsJson"]       = keepObjectPayload ? s->fbObjectsJson : std::string();
+        o["fbEditedObjectsJson"] = keepObjectPayload ? s->fbEditedObjectsJson : std::string();
         o["fbEditSummary"]       = s->fbEditSummary;
         o["fbAccepted"] = s->fbAccepted;
         o["fbRating"]   = s->fbRating;
         o["fbShared"]   = s->fbShared;
         auto tr = matjson::Value::array();
-        for (auto& e : s->transcript) {
+        // The transcript is display-only (the durable AI context is `chat`,
+        // persisted below), so save just its tail. Restoring all 400 entries
+        // per session makes startup parsing and the saved file needlessly
+        // heavy for mobile.
+        constexpr size_t kPersistTranscript = 100;
+        size_t trStart = s->transcript.size() > kPersistTranscript
+            ? s->transcript.size() - kPersistTranscript : 0;
+        for (size_t ti = trStart; ti < s->transcript.size(); ++ti) {
+            auto& e = s->transcript[ti];
             auto eo = matjson::Value::object();
             eo["k"] = (int)e.kind;
             eo["t"] = e.text;
@@ -11563,12 +11577,28 @@ protected:
                       jpeg ? "jpg" : "png", data.size() / 1024);
             return data;
         };
-        // 1000px on JPEG costs about what 512px PNG did.
+        // 1000px on JPEG costs about what 512px PNG did. Phones render,
+        // encode and base64 a smaller frame: the CCRenderTexture readback and
+        // JPEG encode are main-thread stalls, and the extra pixels buy little
+        // legibility on a level overview. Desktop keeps the original budget
+        // exactly; mobile shrinks sooner and caps the payload lower.
+#ifdef GEODE_IS_MOBILE
+        constexpr int    kSnapshotWidth     = 720;
+        constexpr size_t kSnapshotShrinkAt  = 400'000;
+        constexpr size_t kSnapshotMaxBytes  = 600'000;
+#else
+        constexpr int    kSnapshotWidth     = 1000;
+        constexpr size_t kSnapshotShrinkAt  = 700'000;
+        constexpr size_t kSnapshotMaxBytes  = 900'000;
+#endif
         bool jpeg = true;
-        auto vec = renderAt(1000, true);
-        if (vec.empty()) { jpeg = false; vec = renderAt(800, false); }
-        if (vec.size() > 700'000) vec = renderAt(512, jpeg);
-        if (vec.empty() || vec.size() > 900'000) return "";
+        auto vec = renderAt(kSnapshotWidth, true);
+        if (vec.empty()) {
+            jpeg = false;
+            vec = renderAt((int)(kSnapshotWidth * 0.8f), false);
+        }
+        if (vec.size() > kSnapshotShrinkAt) vec = renderAt(512, jpeg);
+        if (vec.empty() || vec.size() > kSnapshotMaxBytes) return "";
         m_snapMime = jpeg ? "image/jpeg" : "image/png";
         m_snapCacheB64 = utils::base64::encode(
             std::span<const std::uint8_t>(vec.data(), vec.size()),

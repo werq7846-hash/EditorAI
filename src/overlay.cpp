@@ -793,6 +793,16 @@ void drawSpans(const std::vector<Span>& spans, float wrapW,
     // Nothing to close out: the final Text call already ended the line.
 }
 
+// Cheap detector for the inline markup drawSpans understands. A line without
+// any of it can be drawn with ONE wrapped TextColored call instead of the
+// span path, which emits geometry per word for every visible line, every
+// frame. On phones that per-word layout is the transcript's dominant cost.
+bool hasInlineMarkup(std::string_view s) {
+    for (char c : s)
+        if (c == '`' || c == '*' || c == '_') return true;
+    return false;
+}
+
 // Render a whole markdown document (or a partial one, mid-stream).
 void render(std::string_view text, const ImVec4& baseCol, float wrapW) {
     if (wrapW < 40.f) wrapW = 40.f;
@@ -929,7 +939,17 @@ void render(std::string_view text, const ImVec4& baseCol, float wrapW) {
         }
 
         ImGui::SetCursorPosX(baseX);
-        drawSpans(inlineSpans(trimmed), wrapW, baseCol);
+        if (hasInlineMarkup(trimmed)) {
+            drawSpans(inlineSpans(trimmed), wrapW, baseCol);
+        } else {
+            // Fast path: plain prose. PushTextWrapPos keeps the same wrap
+            // width as drawSpans, and text continuation lines start at the
+            // current cursor X in ImGui, so the hanging indent is preserved.
+            // "%.*s" avoids a temporary std::string per line.
+            ImGui::PushTextWrapPos(baseX + wrapW);
+            ImGui::TextColored(baseCol, "%.*s", (int)trimmed.size(), trimmed.data());
+            ImGui::PopTextWrapPos();
+        }
     }
     if (inFence) flushFence();
 }
@@ -1143,31 +1163,42 @@ void renderEntry(const GenSession::Entry& e, int idx) {
             renderThinkingBlock("thinking", e.text);
             break;
         case K::ToolCall:
-            ImGui::TextColored(COL_TOOL, "> %s", e.text.substr(0, 90).c_str());
+            // Precision-limited printf: no substr() allocation per frame.
+            ImGui::TextColored(COL_TOOL, "> %.*s", 90, e.text.c_str());
             if (ImGui::IsItemHovered() && e.text.size() > 90)
                 ImGui::SetTooltip("%s", e.text.c_str());
             break;
         case K::ToolResult:
-            if (ImGui::TreeNode(fmt::format("result ({} chars)", e.text.size()).c_str())) {
+        {
+            // Stack label instead of fmt::format every frame.
+            char resultLabel[48];
+            snprintf(resultLabel, sizeof(resultLabel), "result (%zu chars)",
+                     e.text.size());
+            if (ImGui::TreeNode(resultLabel)) {
                 ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
                 ImGui::TextWrapped("%s", e.text.c_str());
                 ImGui::PopStyleColor();
                 ImGui::TreePop();
             }
             break;
+        }
         case K::Status:
         {
-            std::string brief = e.text;
+            // Truncate via a view rather than copying the whole status text
+            // (12 KB) just to show its first 140 bytes.
+            std::string_view brief = e.text;
+            bool truncated = false;
             if (brief.size() > 140) {
                 size_t cut = brief.find_first_of(".\n", 80);
-                if (cut == std::string::npos || cut > 140) cut = 137;
-                brief.resize(cut);
-                brief += "...";
+                if (cut == std::string_view::npos || cut > 140) cut = 137;
+                brief = brief.substr(0, cut);
+                truncated = true;
             }
             ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
-            ImGui::TextWrapped("- %s", brief.c_str());
+            ImGui::TextWrapped("- %.*s%s", (int)brief.size(), brief.data(),
+                               truncated ? "..." : "");
             ImGui::PopStyleColor();
-            if (brief != e.text && ImGui::IsItemHovered())
+            if (truncated && ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s", e.text.c_str());
             break;
         }
@@ -1327,10 +1358,13 @@ void tabChat(float dt) {
     ImGui::BeginChild("transcript", ImVec2(0, -footerH), ImGuiChildFlags_Borders);
     if (sel) {
         bool pinBottom = ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4.f;
-        // Render the newest 150 entries — full 400-entry transcripts cost
-        // real CPU every frame and nobody scrolls that far back.
-        size_t start = sel->transcript.size() > 150
-            ? sel->transcript.size() - 150 : 0;
+        // Render only the newest window — full 400-entry transcripts cost
+        // real CPU every frame and nobody scrolls that far back. Phones get
+        // a smaller window: every visible entry is measured and laid out
+        // again each frame, and mobile pays more for that than desktop.
+        const size_t visibleEntries = uiMobile() ? 80 : 150;
+        size_t start = sel->transcript.size() > visibleEntries
+            ? sel->transcript.size() - visibleEntries : 0;
         if (start > 0)
             ImGui::TextColored(COL_DIM, "(%d older entries not shown)",
                                (int)start);
@@ -2037,8 +2071,10 @@ void drawOverlay() {
 
     // Floating bubble — the touch-device way in (no E key there). Hidden
     // during gameplay: an always-on window would eat taps in its rect, and
-    // mid-attempt is never the moment.
-    if (uiMobile() && !PlayLayer::get()) {
+    // mid-attempt is never the moment. Also hidden while the panel is open
+    // or still fading: the full-screen panel covers it, so submitting a
+    // second window every frame is wasted work on phones.
+    if (uiMobile() && !PlayLayer::get() && !g_st.panelOpen && g_animT <= 0.05f) {
         ImGui::SetNextWindowPos(ImVec2(8, 60), ImGuiCond_FirstUseEver);
         if (ImGui::Begin("##eaibubble", nullptr,
                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
