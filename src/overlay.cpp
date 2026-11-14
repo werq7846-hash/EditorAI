@@ -1271,9 +1271,12 @@ void tabChat(float dt) {
         if (!s) continue;
         ImGui::PushID(i);
         bool sel = !composing && g_st.selectedSessionId == s->id;
-        std::string label = fmt::format("#{}  {}", s->id,
-            s->title.empty() ? "(untitled)" : s->title);
-        if (ImGui::Selectable(label.c_str(), sel)) {
+        // Stack label: this list redraws every frame, so avoid a fmt::format
+        // heap allocation per session per frame on mobile.
+        char label[192];
+        snprintf(label, sizeof(label), "#%d  %s", s->id,
+                 s->title.empty() ? "(untitled)" : s->title.c_str());
+        if (ImGui::Selectable(label, sel)) {
             g_st.composing = false;
             g_st.pendingSelectAfter = -1;   // explicit pick beats auto-jump
             if (g_st.selectedSessionId != s->id) {
@@ -1297,13 +1300,13 @@ void tabChat(float dt) {
         ImGui::PopStyleColor();
         if (s->startedAt > 0 && nowSecs > s->startedAt) {
             int64_t age = nowSecs - s->startedAt;
-            std::string ageStr =
-                age < 60      ? std::string("just now") :
-                age < 3600    ? fmt::format("{}m ago", age / 60) :
-                age < 86400   ? fmt::format("{}h ago", age / 3600) :
-                                fmt::format("{}d ago", age / 86400);
+            char ageStr[32];
+            if (age < 60)         snprintf(ageStr, sizeof(ageStr), "%s", "just now");
+            else if (age < 3600)  snprintf(ageStr, sizeof(ageStr), "%lldm ago", (long long)(age / 60));
+            else if (age < 86400) snprintf(ageStr, sizeof(ageStr), "%lldh ago", (long long)(age / 3600));
+            else                  snprintf(ageStr, sizeof(ageStr), "%lldd ago", (long long)(age / 86400));
             ImGui::SameLine();
-            ImGui::TextColored(COL_DIM, "%s", ageStr.c_str());
+            ImGui::TextColored(COL_DIM, "%s", ageStr);
         }
         if (s->restored) {
             ImGui::SameLine();

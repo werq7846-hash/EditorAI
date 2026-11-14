@@ -24,6 +24,12 @@ if (ANDROID)
     # missing <type_traits> include in the bundled nontype_functional
     # dependency. Force-include it for every TU; harmless otherwise.
     add_compile_options(-include type_traits)
+
+    # Allow intra-.so calls to be inlined/devirtualized instead of going
+    # through the PLT/GOT indirection that -fPIC normally imposes. Exported
+    # symbols are unaffected (visibility is already hidden) and this only
+    # changes call semantics inside the mod's own shared object.
+    add_compile_options(-fno-semantic-interposition)
 endif()
 
 add_subdirectory($ENV{GEODE_SDK} ${CMAKE_CURRENT_BINARY_DIR}/geode)

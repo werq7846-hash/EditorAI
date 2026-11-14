@@ -2288,7 +2288,7 @@ static void injectShortAliases(std::unordered_map<std::string, int>& ids) {
     for (auto [alias, id] : NUMERIC_ALIASES) {
         if (!ids.count(alias)) { ids[alias] = id; ++added; }
     }
-    log::info("Injected {} short aliases into OBJECT_IDS", added);
+    log::info("Injected {} short aliases into the object catalog", added);
 }
 
 static std::unordered_map<std::string, int> loadObjectIDs() {
@@ -2335,18 +2335,32 @@ static std::unordered_map<std::string, int> loadObjectIDs() {
     return ids;
 }
 
-static std::unordered_map<std::string, int> OBJECT_IDS = loadObjectIDs();
+// The bundled catalog is ~155 KB / several thousand entries that get parsed
+// and hashed into a map. Doing that during static initialization delays the
+// game's startup even for players who never open the AI panel, so it is built
+// on first use instead. Magic statics make the first call thread-safe; that
+// call can land on a generation worker thread.
+static const std::unordered_map<std::string, int>& objectIds() {
+    static const std::unordered_map<std::string, int> ids = [] {
+        auto map = loadObjectIDs();
+        log::info("Object library: {} entries ({})", map.size(),
+            map.size() > 10 ? "bundled in .geode" : "defaults only — resource missing!");
+        return map;
+    }();
+    return ids;
+}
 
 // Shared id→name reverse map. Picks the SHORTEST name per ID (ties broken
 // lexicographically for determinism) — short aliases beat verbose canonical
 // names, so everything shown to the AI (level JSON, region queries, level
-// summaries, prompt catalog) costs fewer tokens. OBJECT_IDS is immutable
-// after startup, so this builds exactly once.
+// summaries, prompt catalog) costs fewer tokens. The catalog is immutable
+// once built, so this builds exactly once.
 static const std::unordered_map<int, std::string>& objectIdToName() {
     static const std::unordered_map<int, std::string> map = [] {
+        const auto& ids = objectIds();
         std::unordered_map<int, std::string> m;
-        m.reserve(OBJECT_IDS.size());
-        for (auto& [name, id] : OBJECT_IDS) {
+        m.reserve(ids.size());
+        for (auto& [name, id] : ids) {
             auto it = m.find(id);
             if (it == m.end()
                 || name.size() < it->second.size()
@@ -6076,10 +6090,10 @@ namespace macros {
     using levelcheck::getFloat;
     using levelcheck::getStr;
 
-    // Look up an object name in OBJECT_IDS; if missing, fall back to the
+    // Look up an object name in the catalog; if missing, fall back to the
     // provided default so the macro still produces something.
     static std::string resolveType(const std::string& wanted, const std::string& fallback) {
-        if (OBJECT_IDS.find(wanted) != OBJECT_IDS.end()) return wanted;
+        if (objectIds().find(wanted) != objectIds().end()) return wanted;
         return fallback;
     }
 
@@ -9070,7 +9084,7 @@ static std::string validateEASReport(const std::string& src) {
         auto t = elem["type"].asString();
         if (!t) continue;
         const std::string& name = t.unwrap();
-        bool known = OBJECT_IDS.count(name) > 0
+        bool known = objectIds().count(name) > 0
                   || name.find("_trigger") != std::string::npos;
         if (!known) {
             ++unknown;
@@ -10982,7 +10996,7 @@ protected:
                 "background",
                 provider, model, keyStatus,
                 advFeatures ? "<cg>ON</c>" : "<cr>OFF</c>",
-                OBJECT_IDS.size(), currentObjects
+                objectIds().size(), currentObjects
             )),
             "OK", nullptr,
             380.f, true, 280.f, 1.f
@@ -11287,8 +11301,8 @@ protected:
         int filterId = (int)levelcheck::getFloat(op, "filter_id", 0.f);
         std::string filterType = levelcheck::getStr(op, "filter_type", "");
         if (!filterType.empty() && filterId == 0) {
-            auto it = OBJECT_IDS.find(filterType);
-            if (it != OBJECT_IDS.end()) filterId = it->second;
+            auto it = objectIds().find(filterType);
+            if (it != objectIds().end()) filterId = it->second;
         }
 
         auto passesFilter = [&](GameObject* go) {
@@ -11342,8 +11356,8 @@ protected:
             std::string body = sel.substr(3);
             int id = geode::utils::numFromString<int>(body).unwrapOr(0);
             if (id == 0) {
-                auto it = OBJECT_IDS.find(body);
-                if (it != OBJECT_IDS.end()) id = it->second;
+                auto it = objectIds().find(body);
+                if (it != objectIds().end()) id = it->second;
             }
             if (id == 0) return out;
             filterId = id;
@@ -11779,8 +11793,19 @@ protected:
             return;
         }
 
-        for (int b = 0; b < m_spawnBatchSize && m_currentObjectIndex < m_deferredObjects.size(); ++b)
+        // Phones can stall for several ms per object, so placing the whole
+        // configured batch regardless makes every editor frame hitch while a
+        // live build streams in. Treat spawn-batch-size as a MAXIMUM and stop
+        // once this tick has used its budget; leftover objects simply roll
+        // into the next 50 ms tick. Desktop batches finish far inside the
+        // budget, so their behaviour is unchanged.
+        constexpr auto kSpawnTickBudget = std::chrono::milliseconds(8);
+        const auto spawnTickStart = std::chrono::steady_clock::now();
+        for (int b = 0; b < m_spawnBatchSize && m_currentObjectIndex < m_deferredObjects.size(); ++b) {
             if (!spawnDeferredOne()) return;
+            if (std::chrono::steady_clock::now() - spawnTickStart >= kSpawnTickBudget)
+                break;
+        }
 
         if (m_currentObjectIndex % 10 == 0) {
             float pct = (float)m_currentObjectIndex / (float)m_deferredObjects.size() * 100.0f;
@@ -12689,8 +12714,8 @@ protected:
             if (trigIt != TRIGGER_IDS.end()) {
                 slot["id"] = trigIt->second;
             } else {
-                auto it = OBJECT_IDS.find(typeName);
-                slot["id"] = (it != OBJECT_IDS.end()) ? it->second : 1;
+                auto it = objectIds().find(typeName);
+                slot["id"] = (it != objectIds().end()) ? it->second : 1;
             }
         }
 
@@ -13208,15 +13233,15 @@ protected:
         // needless cost multiplier on hosted APIs. This list covers every
         // gameplay-essential shape plus core decoration; the AI reaches the
         // long tail via the search_objects tool or `OBJ <name>`. Built once
-        // (deterministic after startup); names missing from OBJECT_IDS are
-        // silently skipped (defensive against object_ids.json drift).
+        // (deterministic); names missing from the catalog are silently skipped
+        // (defensive against object_ids.json drift).
         static const std::pair<std::string, size_t> s_catalog = [] {
             std::string list;
             size_t included = 0;
             list.reserve(COMPACT_OBJECT_ALLOWLIST.size() * 32);
             bool first = true;
             for (const auto& name : COMPACT_OBJECT_ALLOWLIST) {
-                if (OBJECT_IDS.find(name) == OBJECT_IDS.end()) continue;
+                if (objectIds().find(name) == objectIds().end()) continue;
                 if (!first) list += ", ";
                 list += name;
                 first = false;
@@ -13688,9 +13713,9 @@ protected:
     }
 
     // Parses a decoded GD level string and produces a compact EAI-formatted
-    // summary the AI can crib from. Maps object IDs to names via OBJECT_IDS
-    // where possible; skips unknown ones rather than emitting opaque "obj_N"
-    // tokens that the AI couldn't reproduce.
+    // summary the AI can crib from. Maps object IDs to names via the object
+    // catalog where possible; skips unknown ones rather than emitting opaque
+    // "obj_N" tokens that the AI couldn't reproduce.
     static std::string summarizeReferenceLevel(const std::string& name,
                                                const std::string& desc,
                                                const std::string& idStr,
@@ -15868,7 +15893,7 @@ protected:
             // legacy spellings). Dedupe by ID, keeping the shortest name, so
             // 30 result slots mean 30 distinct objects instead of ~15.
             std::unordered_map<int, std::string> byId;
-            for (auto& [name, id] : OBJECT_IDS) {
+            for (auto& [name, id] : objectIds()) {
                 if (name.find(query) == std::string::npos) continue;
                 // prepareObjects drops particle_ objects — don't return names
                 // the model can never place.
@@ -21216,8 +21241,9 @@ $execute {
     log::info("========================================");
     log::info("         Editor AI {}", Mod::get()->getVersion().toVString());
     log::info("========================================");
-    log::info("Object library: {} entries ({})", OBJECT_IDS.size(),
-        OBJECT_IDS.size() > 10 ? "bundled in .geode" : "defaults only — resource missing!");
+    // The object catalog is deliberately NOT touched here: parsing its ~155 KB
+    // and building the map on first use keeps that cost out of game startup.
+    log::info("Object catalog: loads on first use");
 
     std::string provider = Mod::get()->getSettingValue<std::string>("ai-provider");
     std::string model    = getProviderModel(provider);
@@ -21231,8 +21257,10 @@ $execute {
     log::info("Advanced features: {}",
         Mod::get()->getSettingValue<bool>("enable-advanced-features") ? "ON" : "OFF");
 
-    // Warm the reverse ID→name map now (~4k entries) so the first generation
-    // doesn't pay the build cost mid-flight.
-    (void)objectIdToName();
+    // The object catalog and its reverse map are built lazily on first use
+    // (see objectIds()); warming them here would spend that startup time for
+    // every player, including those who never open the AI. The one-off cost
+    // is paid at the start of the first generation instead, which is already
+    // waiting on the network.
     log::info("========================================");
 }
