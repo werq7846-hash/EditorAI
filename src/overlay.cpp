@@ -12,9 +12,14 @@
 #include <Geode/modify/CCKeyboardDispatcher.hpp>
 #endif
 #include <imgui-cocos.hpp>
+// imgui_internal.h is used for two small, stable pieces of the touch layer:
+// ClearActiveID() (cancel a tap once a finger turns into a scroll drag) and
+// the RenderText* helpers (single-line clipped rows). Nothing else.
+#include <imgui_internal.h>
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <unordered_set>
 #include <cstring>
 #include <unordered_map>
@@ -122,6 +127,7 @@ struct OverlayState {
     char chatInput[2048] = {};
     int  chatMode = 0;              // 0 edit, 1 plan, 2 chat
     bool composing = false;         // right pane shows the new-chat composer
+    bool mobileListOpen = false;    // phones: sessions drawer instead of a column
     // Composer ("+ new chat")
     char genPrompt[4096] = {};
     int  genTarget = -1;            // -1 current, -2 new, >=0 local index
@@ -232,6 +238,81 @@ bool uiMobile() {
 #endif
 }
 
+// ── Touch ergonomics ─────────────────────────────────────────────────────────
+// Mobile-only helpers. Every one falls back to the exact widget the mod used
+// before when uiMobile() is false, so desktop layout and behaviour do not
+// change at all.
+constexpr float kTouchTarget = 44.f;   // Android's minimum comfortable target
+
+// SmallButton is one text line tall (~19 dp) — unusable through a finger.
+// Phones get a real Button at 44 dp; width < 0 stretches to the pane width.
+bool smallAction(const char* label, float width = 0.f) {
+    if (!uiMobile()) return ImGui::SmallButton(label);
+    return ImGui::Button(label, ImVec2(width, kTouchTarget));
+}
+
+// A Selectable list row. `size_arg.x == 0` already means "span the width";
+// only the height (normally one text line) needs the touch minimum.
+bool selectRow(const char* label, bool selected = false, float height = 0.f) {
+    if (!uiMobile()) return ImGui::Selectable(label, selected);
+    return ImGui::Selectable(label, selected, ImGuiSelectableFlags_None,
+                             ImVec2(0.f, height > 0.f ? height : kTouchTarget));
+}
+
+// Controls that OWN a press+drag (sliders, text fields) must keep the gesture
+// instead of scrolling the pane under the finger. They register their ID here
+// while hovered; touchScroll() checks it before turning a drag into a scroll.
+std::unordered_set<ImGuiID> g_dragOwners;
+void ownsDragIfHovered() {
+    if (!uiMobile()) return;
+    if (ImGui::IsItemHovered())
+        g_dragOwners.insert(ImGui::GetItemID());
+}
+
+// Finger-drag scrolling. Phones have no wheel: gd-imgui-cocos reports a touch
+// as a held left mouse button, so a scrollable pane would never move on its
+// own. Call ONCE at the end of each scrollable child (after its items, so
+// ImGui already knows what is under the finger).
+//   - a press that moves less than 10 dp stays a normal tap/click;
+//   - past the threshold the gesture becomes a scroll and the pressed widget
+//     is deactivated, so releasing it cannot also click something;
+//   - widgets registered by ownsDragIfHovered() are never stolen.
+void touchScroll() {
+    if (!uiMobile()) return;
+    if (ImGui::GetScrollMaxY() <= 1.f) return;
+    ImGuiContext& g = *ImGui::GetCurrentContext();
+    const ImGuiIO& io = ImGui::GetIO();
+
+    static ImGuiID s_owner = 0;      // child being scrolled
+    static ImGuiID s_item = 0;       // widget under the finger at press time
+    static ImVec2  s_start{};
+    static float   s_scroll0 = 0.f;
+
+    // Per-window identity: the same literal hashes differently in each child.
+    ImGuiID self = ImGui::GetID("##eai-scroll");
+
+    // AllowWhenBlockedByActiveItem: the press that starts a drag has ALREADY
+    // made the item under the finger the active one, which makes a plain
+    // IsWindowHovered() return false — exactly when we need it to be true.
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+        ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem)) {
+        s_owner   = self;
+        s_item    = g.HoveredId;     // resolved during this frame's item pass
+        s_start   = io.MousePos;
+        s_scroll0 = ImGui::GetScrollY();
+    }
+    if (s_owner != self) return;
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        s_owner = 0;
+        return;
+    }
+    float dy = s_start.y - io.MousePos.y;
+    if (std::fabs(dy) < 10.f) return;
+    if (s_item && g_dragOwners.count(s_item)) { s_owner = 0; return; }
+    ImGui::ClearActiveID();          // the gesture is a scroll, not a tap
+    ImGui::SetScrollY(std::clamp(s_scroll0 + dy, 0.f, ImGui::GetScrollMaxY()));
+}
+
 ImVec4 stateColor(GenSession::State s) {
     switch (s) {
         case GenSession::State::Running:        return COL_WARN;
@@ -243,6 +324,49 @@ ImVec4 stateColor(GenSession::State s) {
     return ImVec4(1, 1, 1, 1);
 }
 
+// A full-width mobile session row: one-line title + state/age line and a
+// colored state stripe. Drawn by hand (rather than Selectable's label) so the
+// WHOLE ~58 dp row is one tap target and long titles clip instead of wrapping.
+bool sessionRow(const GenSession& s, bool selected, int64_t nowSecs) {
+    constexpr float rowH = 58.f;
+    bool clicked = ImGui::Selectable("##row", selected,
+                                     ImGuiSelectableFlags_None,
+                                     ImVec2(0.f, rowH));
+    ImVec2 a = ImGui::GetItemRectMin();
+    ImVec2 b = ImGui::GetItemRectMax();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec4 sc = stateColor(s.state);
+    dl->AddRectFilled(ImVec2(a.x + 3.f, a.y + 8.f),
+                      ImVec2(a.x + 7.f, b.y - 8.f),
+                      ImGui::GetColorU32(sc), 2.f);
+
+    char meta[128];
+    if (s.startedAt > 0 && nowSecs > s.startedAt) {
+        int64_t age = nowSecs - s.startedAt;
+        char ageStr[32];
+        if (age < 60)         snprintf(ageStr, sizeof(ageStr), "%s", "just now");
+        else if (age < 3600)  snprintf(ageStr, sizeof(ageStr), "%lldm ago", (long long)(age / 60));
+        else if (age < 86400) snprintf(ageStr, sizeof(ageStr), "%lldh ago", (long long)(age / 3600));
+        else                  snprintf(ageStr, sizeof(ageStr), "%lldd ago", (long long)(age / 86400));
+        snprintf(meta, sizeof(meta), "#%d  %s  |  %s", s.id, s.stateName(), ageStr);
+    } else {
+        snprintf(meta, sizeof(meta), "#%d  %s", s.id, s.stateName());
+    }
+
+    const float right = b.x - 10.f;
+    ImGui::PushStyleColor(ImGuiCol_Text,
+        selected ? ImVec4(1.f, 1.f, 1.f, 1.f) : ImVec4(0.92f, 0.93f, 0.95f, 1.f));
+    ImGui::RenderTextEllipsis(dl, ImVec2(a.x + 16.f, a.y + 8.f),
+        ImVec2(right, b.y), right,
+        s.title.empty() ? "(untitled)" : s.title.c_str(), nullptr, nullptr);
+    ImGui::PopStyleColor();
+    ImGui::PushStyleColor(ImGuiCol_Text, sc);
+    ImGui::RenderTextEllipsis(dl, ImVec2(a.x + 16.f, a.y + 31.f),
+        ImVec2(right, b.y - 4.f), right, meta, nullptr, nullptr);
+    ImGui::PopStyleColor();
+    return clicked;
+}
+
 void tipIfHovered(const char* tip) {
     if (tip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         ImGui::SetTooltip("%s", tip);
@@ -251,6 +375,40 @@ void tipIfHovered(const char* tip) {
 // ── Settings widgets (write-through to mod settings; every one has a tip) ───
 void settingToggle(const char* label, const char* id, const char* tip = nullptr) {
     bool v = editoraiGetBool(id);
+    if (uiMobile()) {
+        // Phones: the whole row is the switch. Checkbox labels cannot wrap, so
+        // long labels would run off the screen; this lays the text out with
+        // wrapping and parks a clear ON/OFF pill on the right.
+        float avail = std::max(ImGui::GetContentRegionAvail().x, 120.f);
+        float textW = std::max(avail - 104.f, 80.f);
+        ImVec2 textSize = ImGui::CalcTextSize(label, nullptr, false, textW);
+        float rowH = std::max(52.f, textSize.y + 24.f);
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        ImGui::InvisibleButton(fmt::format("##toggle-{}", id).c_str(),
+                               ImVec2(avail, rowH));
+        bool hovered = ImGui::IsItemHovered();
+        if (ImGui::IsItemClicked()) {
+            v = !v;
+            editoraiSetBool(id, v);
+        }
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(p, ImVec2(p.x + avail, p.y + rowH),
+            ImGui::GetColorU32(hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg),
+            6.f);
+        ImGui::RenderTextWrapped(ImVec2(p.x + 12.f, p.y + 11.f), label, nullptr, textW);
+        const char* state = v ? "ON" : "OFF";
+        ImVec2 ss = ImGui::CalcTextSize(state);
+        float pillW = std::max(ss.x + 24.f, 56.f);
+        ImVec2 pMin(p.x + avail - pillW - 10.f, p.y + (rowH - 30.f) * 0.5f);
+        ImVec2 pMax(pMin.x + pillW, pMin.y + 30.f);
+        dl->AddRectFilled(pMin, pMax,
+            ImGui::GetColorU32(v ? COL_ACCENT : COL_DIM), 15.f);
+        dl->AddText(ImVec2(pMin.x + (pillW - ss.x) * 0.5f,
+                           pMin.y + (30.f - ss.y) * 0.5f),
+                    IM_COL32(14, 15, 20, 255), state);
+        tipIfHovered(tip);
+        return;
+    }
     if (ImGui::Checkbox(fmt::format("{}##{}", label, id).c_str(), &v))
         editoraiSetBool(id, v);
     tipIfHovered(tip);
@@ -259,10 +417,11 @@ void settingToggle(const char* label, const char* id, const char* tip = nullptr)
 void settingInt(const char* label, const char* id, int mn, int mx,
                 const char* tip = nullptr, ImGuiSliderFlags flags = 0) {
     int v = (int)editoraiGetInt(id);
-    ImGui::SetNextItemWidth(170.f);
+    ImGui::SetNextItemWidth(std::min(170.f, ImGui::GetContentRegionAvail().x));
     if (ImGui::SliderInt(fmt::format("{}##{}", label, id).c_str(), &v, mn, mx,
                          "%d", flags))
         editoraiSetInt(id, (int64_t)v);
+    ownsDragIfHovered();
     tipIfHovered(tip);
 }
 
@@ -329,19 +488,20 @@ void endpointProfilesWidget() {
         selected.clear();
 
     ImGui::TextColored(COL_DIM, "saved locally");
-    ImGui::SetNextItemWidth(210.f);
+    ImGui::SetNextItemWidth(uiMobile()
+        ? -1.f : std::min(210.f, ImGui::GetContentRegionAvail().x));
     if (ImGui::BeginCombo("endpoint profile##custom-profiles",
                           selected.empty() ? "(none)" : selected.c_str())) {
         for (auto& p : profiles) {
             bool isSelected = selected == p.name;
-            if (ImGui::Selectable(p.name.c_str(), isSelected)) selected = p.name;
+            if (selectRow(p.name.c_str(), isSelected)) selected = p.name;
             if (isSelected) ImGui::SetItemDefaultFocus();
         }
         ImGui::EndCombo();
     }
-    ImGui::SameLine();
+    if (!uiMobile()) ImGui::SameLine();
     ImGui::BeginDisabled(selected.empty());
-    if (ImGui::SmallButton("Load")) {
+    if (smallAction("Load", uiMobile() ? -1.f : 0.f)) {
         for (auto& p : profiles) if (p.name == selected) {
             editoraiSetStr("custom-provider-name", p.name);
             editoraiSetStr("custom-provider-url", p.url);
@@ -352,8 +512,8 @@ void endpointProfilesWidget() {
             break;
         }
     }
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Delete")) {
+    if (!uiMobile()) ImGui::SameLine();
+    if (smallAction("Delete", uiMobile() ? -1.f : 0.f)) {
         profiles.erase(std::remove_if(profiles.begin(), profiles.end(),
             [&](const EndpointProfile& p) { return p.name == selected; }), profiles.end());
         saveEndpointProfiles(profiles);
@@ -361,11 +521,13 @@ void endpointProfilesWidget() {
     }
     ImGui::EndDisabled();
 
-    ImGui::SetNextItemWidth(150.f);
+    ImGui::SetNextItemWidth(uiMobile()
+        ? -1.f : std::min(150.f, ImGui::GetContentRegionAvail().x));
     ImGui::InputTextWithHint("##endpoint-profile-name", "profile name",
         newName.data(), newName.size(), TEXT_SELECTION_FLAGS, textSelectionCallback);
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Save current")) {
+    ownsDragIfHovered();
+    if (!uiMobile()) ImGui::SameLine();
+    if (smallAction("Save current", uiMobile() ? -1.f : 0.f)) {
         std::string name = newName.data();
         if (name.empty()) name = editoraiGetStr("custom-provider-name");
         std::string url = editoraiGetStr("custom-provider-url");
@@ -400,11 +562,14 @@ void settingText(const char* label, const std::string& id,
         std::string cur = editoraiGetStr(id.c_str());
         snprintf(tb.buf.data(), tb.buf.size(), "%s", cur.c_str());
     }
-    ImGui::SetNextItemWidth(std::min(280.f, ImGui::GetContentRegionAvail().x));
+    ImGui::SetNextItemWidth(uiMobile()
+        ? -1.f
+        : std::min(280.f, ImGui::GetContentRegionAvail().x));
     ImGui::InputTextWithHint(fmt::format("{}##{}", label, id).c_str(), hint,
         tb.buf.data(), tb.buf.size(), TEXT_SELECTION_FLAGS |
         (secret ? ImGuiInputTextFlags_Password : ImGuiInputTextFlags_None),
         textSelectionCallback);
+    ownsDragIfHovered();
     tb.editing = ImGui::IsItemActive();
     tipIfHovered(tip);
     if (ImGui::IsItemDeactivatedAfterEdit()) {
@@ -425,7 +590,7 @@ void settingCombo(const char* label, const char* id,
     if (ImGui::BeginCombo(fmt::format("{}##{}", label, id).c_str(), preview)) {
         for (auto* opt : options) {
             bool sel = cur == opt;
-            if (ImGui::Selectable(*opt ? opt : "(none)", sel))
+            if (selectRow(*opt ? opt : "(none)", sel))
                 editoraiSetStr(id, opt);
             if (sel) ImGui::SetItemDefaultFocus();
         }
@@ -493,7 +658,7 @@ void qualityProfileWidget() {
                 std::strcmp(p, "fast") == 0 ? "fast (cheaper)" :
                 std::strcmp(p, "premium") == 0 ? "premium (best, default)" :
                 "balanced";
-            if (ImGui::Selectable(lbl, sel)) applyQualityProfile(p);
+            if (selectRow(lbl, sel)) applyQualityProfile(p);
             if (sel) ImGui::SetItemDefaultFocus();
         }
         ImGui::EndCombo();
@@ -603,7 +768,7 @@ bool savedLevelSuggest(char* buf, size_t bufSize) {
         ImGui::TextColored(COL_DIM, "your saved levels:");
         for (auto* l : matches) {
             ImGui::PushID(l->levelId);
-            if (ImGui::Selectable(
+            if (selectRow(
                     fmt::format("{}  ({})", l->name, l->levelId).c_str())) {
                 snprintf(buf, bufSize, "%d", l->levelId);
                 picked = true;
@@ -988,11 +1153,11 @@ void settingModelCombo(const char* id,
     if (ImGui::BeginCombo(fmt::format("model##{}", id).c_str(), preview)) {
         for (auto* opt : presets) {
             bool sel = !custom && cur == opt;
-            if (ImGui::Selectable(opt, sel)) { editoraiSetStr(id, opt); custom = false; }
+            if (selectRow(opt, sel)) { editoraiSetStr(id, opt); custom = false; }
             if (sel) ImGui::SetItemDefaultFocus();
         }
         ImGui::Separator();
-        if (ImGui::Selectable("custom...", custom)) custom = true;
+        if (selectRow("custom...", custom)) custom = true;
         ImGui::EndCombo();
     }
     tipIfHovered(tip);
@@ -1021,7 +1186,7 @@ void ollamaModelSelector() {
         if (state == 3) {
             for (auto& m : models) {
                 bool sel = (cur == m);
-                if (ImGui::Selectable(m.c_str(), sel)) editoraiSetStr("ollama-model", m);
+                if (selectRow(m.c_str(), sel)) editoraiSetStr("ollama-model", m);
                 if (sel) ImGui::SetItemDefaultFocus();
             }
         } else {
@@ -1038,7 +1203,7 @@ void ollamaModelSelector() {
                  "server - pick one, or type a custom tag below.");
 
     ImGui::SameLine();
-    if (ImGui::SmallButton(state == 1 ? "..." : "Refresh"))
+    if (smallAction(state == 1 ? "..." : "Refresh"))
         editoraiRefreshOllamaModels();
     tipIfHovered("Re-fetch the model list from the server.");
 
@@ -1122,7 +1287,8 @@ void renderThinkingBlock(const char* label, const std::string& text,
 {
     if (forceOpen) ImGui::SetNextItemOpen(*forceOpen);
     ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
-    bool open = ImGui::TreeNodeEx(label);
+    bool open = ImGui::TreeNodeEx(label, uiMobile()
+        ? ImGuiTreeNodeFlags_FramePadding : ImGuiTreeNodeFlags_None);
     ImGui::PopStyleColor();
     if (!open) return;
     md::render(text, COL_DIM, transcriptWrapW(ImGui::GetTreeNodeToLabelSpacing()));
@@ -1174,7 +1340,9 @@ void renderEntry(const GenSession::Entry& e, int idx) {
             char resultLabel[48];
             snprintf(resultLabel, sizeof(resultLabel), "result (%zu chars)",
                      e.text.size());
-            if (ImGui::TreeNode(resultLabel)) {
+            if (ImGui::TreeNodeEx(resultLabel, uiMobile()
+                    ? ImGuiTreeNodeFlags_FramePadding
+                    : ImGuiTreeNodeFlags_None)) {
                 ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
                 ImGui::TextWrapped("%s", e.text.c_str());
                 ImGui::PopStyleColor();
@@ -1210,6 +1378,7 @@ void renderEntry(const GenSession::Entry& e, int idx) {
 }
 
 void composerBody(float dt);   // the "+ new chat" pane (defined below)
+void chatTabMobile(float dt);  // phones: single-pane chat (defined below)
 
 void tabChat(float dt) {
     auto& sessions = genSessions();
@@ -1234,11 +1403,16 @@ void tabChat(float dt) {
     }
     bool composing = g_st.composing;
 
+    if (uiMobile()) {
+        chatTabMobile(dt);
+        return;
+    }
+
     ImGui::BeginChild("list", ImVec2(210, 0), ImGuiChildFlags_None);
     {
         // New chat — selecting it swaps the right pane to the composer.
         ImGui::PushStyleColor(ImGuiCol_Text, COL_ACCENT);
-        if (ImGui::Selectable("+  new chat", composing))
+        if (selectRow("+  new chat", composing))
             g_st.composing = true;
         ImGui::PopStyleColor();
         tipIfHovered("Describe a level and pick where it goes - the "
@@ -1251,7 +1425,7 @@ void tabChat(float dt) {
             if (s && (s->state == GenSession::State::Done ||
                       s->state == GenSession::State::Failed)) { anyFinished = true; break; }
         if (anyFinished) {
-            if (ImGui::SmallButton("clear finished")) {
+            if (smallAction("clear finished")) {
                 auto& all = genSessions();
                 all.erase(std::remove_if(all.begin(), all.end(), [](auto& s) {
                     return !s || s->state == GenSession::State::Done ||
@@ -1276,7 +1450,7 @@ void tabChat(float dt) {
         char label[192];
         snprintf(label, sizeof(label), "#%d  %s", s->id,
                  s->title.empty() ? "(untitled)" : s->title.c_str());
-        if (ImGui::Selectable(label, sel)) {
+        if (selectRow(label, sel)) {
             g_st.composing = false;
             g_st.pendingSelectAfter = -1;   // explicit pick beats auto-jump
             if (g_st.selectedSessionId != s->id) {
@@ -1396,17 +1570,17 @@ void tabChat(float dt) {
         for (int r = 1; r <= 10; ++r) {
             ImGui::SameLine();
             ImGui::PushID(900 + r);
-            if (ImGui::SmallButton(std::to_string(r).c_str()))
+            if (smallAction(std::to_string(r).c_str()))
                 editoraiRateSession(sel, r);
             ImGui::PopID();
         }
         ImGui::SameLine();
-        if (ImGui::SmallButton("skip")) {
+        if (smallAction("skip")) {
             sel->needsRating = false;
             editoraiMarkSessionsDirty();  // skip must survive restarts too
         }
     } else if (showRetry) {
-        if (ImGui::SmallButton("retry with same prompt")) {
+        if (smallAction("retry with same prompt")) {
             snprintf(g_st.genPrompt, sizeof(g_st.genPrompt), "%s",
                      sel->fbPrompt.c_str());
             editoraiSetSavedStr("ov-gen-prompt", g_st.genPrompt);
@@ -1418,7 +1592,7 @@ void tabChat(float dt) {
 
     // Export the full conversation to a text file (debugging / sharing).
     if (sel) {
-        if (ImGui::SmallButton("export")) {
+        if (smallAction("export")) {
             std::string err;
             if (editoraiExportSession(sel, err))
                 ImGui::SetTooltip("%s", err.c_str());
@@ -1481,12 +1655,19 @@ void composerBody(float dt) {
     }
 
     bool manualProv = editoraiGetStr("ai-provider") == "manual";
+    const bool mobile = uiMobile();
+    // Phones stack everything vertically and let the pane scroll: with the
+    // options expanded the form is taller than any screen.
+    if (mobile) ImGui::BeginChild("composerScroll", ImVec2(0, 0),
+                                  ImGuiChildFlags_None);
 
     // ── The prompt IS the interface ─────────────────────────────────────────
     // Reserve room for the strip + button row below, and give the rest to the
     // message box so it feels like a chat composer rather than a form field.
     float footer = ImGui::GetFrameHeightWithSpacing() * 2.f + 34.f;
-    float inputH = std::max(ImGui::GetContentRegionAvail().y - footer, 90.f);
+    float inputH = mobile
+        ? std::clamp(ImGui::GetContentRegionAvail().y * 0.40f, 140.f, 260.f)
+        : std::max(ImGui::GetContentRegionAvail().y - footer, 90.f);
     // Ctrl+Enter sends; plain Enter inserts a newline (multi-line prompts are
     // common, so Enter must not fire the generation).
     bool sendNow = ImGui::InputTextMultiline("##prompt",
@@ -1494,6 +1675,7 @@ void composerBody(float dt) {
         ImGuiInputTextFlags_EnterReturnsTrue | TEXT_SELECTION_FLAGS,
         textSelectionCallback) &&
         ImGui::GetIO().KeyCtrl;
+    ownsDragIfHovered();
     bool typing = ImGui::IsItemActive();
     if (g_st.genPrompt[0] == '\0' && !typing) {
         // Hint drawn inside the empty box (InputTextMultiline has no hint API).
@@ -1517,36 +1699,40 @@ void composerBody(float dt) {
             ? g_st.levels[g_st.genTarget].name
             : "?");
     ImGui::TextColored(COL_DIM, "to");
-    ImGui::SameLine(0.f, 4.f);
-    ImGui::SetNextItemWidth(150.f);
+    if (mobile) {
+        ImGui::SetNextItemWidth(-1.f);
+    } else {
+        ImGui::SameLine(0.f, 4.f);
+        ImGui::SetNextItemWidth(150.f);
+    }
     if (ImGui::BeginCombo("##target", preview.c_str())) {
-        if (ImGui::Selectable("current editor", g_st.genTarget == -1))
+        if (selectRow("current editor", g_st.genTarget == -1))
             g_st.genTarget = -1;
-        if (ImGui::Selectable("+ new level", g_st.genTarget == -2))
+        if (selectRow("+ new level", g_st.genTarget == -2))
             g_st.genTarget = -2;
         if (!g_st.levels.empty()) ImGui::Separator();
         for (int i = 0; i < (int)g_st.levels.size(); ++i) {
             ImGui::PushID(i);
             std::string lbl = fmt::format("{} ({} obj)",
                 g_st.levels[i].name, g_st.levels[i].objectCount);
-            if (ImGui::Selectable(lbl.c_str(), g_st.genTarget == i))
+            if (selectRow(lbl.c_str(), g_st.genTarget == i))
                 g_st.genTarget = i;
             ImGui::PopID();
         }
         ImGui::Separator();
-        if (ImGui::Selectable("refresh list")) g_st.levelsFresh = false;
+        if (selectRow("refresh list")) g_st.levelsFresh = false;
         ImGui::EndCombo();
     }
     tipIfHovered("Where the objects go: the level you're in, a brand-new "
                  "level, or any of your created levels.");
     if (g_st.genTarget != -2) {
-        ImGui::SameLine();
+        if (!mobile) ImGui::SameLine();
         if (ImGui::Checkbox("replace", &g_st.genReplace))
             editoraiSetSavedInt("ov-gen-replace", g_st.genReplace ? 1 : 0);
         tipIfHovered("On: rebuild the level from scratch.\n"
                      "Off: add to what's already there.");
     }
-    ImGui::SameLine();
+    if (!mobile) ImGui::SameLine();
     // Live summary of the knobs, click to expand.
     static bool s_optionsOpen = false;
     {
@@ -1556,9 +1742,13 @@ void composerBody(float dt) {
         std::string sum  = fmt::format("{} | {} | {}",
             diff.empty() ? "?" : diff, len.empty() ? "?" : len,
             sty == "levelID" ? "reference" : (sty.empty() ? "?" : sty));
-        if (ImGui::SmallButton(fmt::format("{}  {}",
-                s_optionsOpen ? "v" : ">", sum).c_str()))
-            s_optionsOpen = !s_optionsOpen;
+        // Phones get a full-width row for the knobs (one clear tap target).
+        bool toggled = mobile
+            ? ImGui::Button(fmt::format("{}  {}", s_optionsOpen ? "v" : ">",
+                                        sum).c_str(), ImVec2(-1.f, kTouchTarget))
+            : smallAction(fmt::format("{}  {}", s_optionsOpen ? "v" : ">",
+                                      sum).c_str());
+        if (toggled) s_optionsOpen = !s_optionsOpen;
         tipIfHovered("Difficulty, length and style. Click to change them.");
     }
 
@@ -1571,22 +1761,22 @@ void composerBody(float dt) {
             std::string cur = editoraiGetStr("difficulty");
             bool isPreset = std::find_if(PRESETS.begin(), PRESETS.end(),
                 [&](const char* p) { return cur == p; }) != PRESETS.end();
-            ImGui::SetNextItemWidth(150.f);
+            ImGui::SetNextItemWidth(mobile ? -1.f : 150.f);
             if (ImGui::BeginCombo("difficulty##diffsel",
                     (!isPreset || g_st.diffCustom) ? "custom..." : cur.c_str())) {
                 for (auto* p : PRESETS)
-                    if (ImGui::Selectable(p, cur == p)) {
+                    if (selectRow(p, cur == p)) {
                         editoraiSetStr("difficulty", p);
                         g_st.diffCustom = false;
                     }
-                if (ImGui::Selectable("custom...", g_st.diffCustom || !isPreset))
+                if (selectRow("custom...", g_st.diffCustom || !isPreset))
                     g_st.diffCustom = true;
                 ImGui::EndCombo();
             }
             tipIfHovered("How hard the level should be. 'custom...' lets you "
                          "type anything - e.g. 'insane demon' or 'chill auto'.");
             if (g_st.diffCustom || !isPreset) {
-                ImGui::SameLine();
+                if (!mobile) ImGui::SameLine();
                 settingText("##customdiff", "difficulty", "your difficulty",
                             false, "Free-form difficulty the AI aims for.");
             }
@@ -1599,21 +1789,21 @@ void composerBody(float dt) {
             bool isPreset = std::find_if(PRESETS.begin(), PRESETS.end(),
                 [&](const char* p) { return cur == p; }) != PRESETS.end();
             bool isLevelId = cur == "levelID";
-            ImGui::SetNextItemWidth(150.f);
+            ImGui::SetNextItemWidth(mobile ? -1.f : 150.f);
             const char* stylePreview =
                 isLevelId ? "levelID"
                           : ((g_st.styleCustom || !isPreset) ? "custom..." : cur.c_str());
             if (ImGui::BeginCombo("style##stylesel", stylePreview)) {
                 for (auto* p : PRESETS)
-                    if (ImGui::Selectable(p, cur == p)) {
+                    if (selectRow(p, cur == p)) {
                         editoraiSetStr("style", p);
                         g_st.styleCustom = false;
                     }
-                if (ImGui::Selectable("levelID", isLevelId)) {
+                if (selectRow("levelID", isLevelId)) {
                     editoraiSetStr("style", "levelID");
                     g_st.styleCustom = false;
                 }
-                if (ImGui::Selectable("custom...", g_st.styleCustom))
+                if (selectRow("custom...", g_st.styleCustom))
                     g_st.styleCustom = true;
                 ImGui::EndCombo();
             }
@@ -1622,11 +1812,12 @@ void composerBody(float dt) {
                          "just name a level in the prompt - the AI can search "
                          "for it itself.");
             if (isLevelId && !g_st.styleCustom) {
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(170.f);
+                if (!mobile) ImGui::SameLine();
+                ImGui::SetNextItemWidth(mobile ? -1.f : 170.f);
                 ImGui::InputTextWithHint("##stylelvl", "ID or saved-level name",
                     g_st.styleLevelId, sizeof(g_st.styleLevelId),
                     TEXT_SELECTION_FLAGS, textSelectionCallback);
+                ownsDragIfHovered();
                 bool edited  = ImGui::IsItemDeactivatedAfterEdit();
                 // Capture BEFORE the suggest window's Begin/End clobbers
                 // LastItemData — else this tooltip can never fire.
@@ -1639,7 +1830,7 @@ void composerBody(float dt) {
                                       "from the dropdown. The AI downloads it "
                                       "and matches its style.");
             } else if (g_st.styleCustom || (!isPreset && !isLevelId)) {
-                ImGui::SameLine();
+                if (!mobile) ImGui::SameLine();
                 settingText("##customstyle", "style", "your style", false,
                             "Free-form style words the AI aims for.");
             } else if (g_st.styleLevelId[0] && !isLevelId) {
@@ -1654,10 +1845,11 @@ void composerBody(float dt) {
             "extension rounds automatically.");
         {
             int v = (int)editoraiGetInt("target-object-count");
-            ImGui::SetNextItemWidth(150.f);
+            ImGui::SetNextItemWidth(mobile ? -1.f : 150.f);
             if (ImGui::InputInt("target objects##tgtobj", &v, 100, 1000))
                 editoraiSetInt("target-object-count",
                                (int64_t)std::clamp(v, 0, 20000));
+            ownsDragIfHovered();
             tipIfHovered("Minimum total objects the level must reach - the AI "
                          "keeps building (densifying and decorating) until it "
                          "gets there. 0 = let the AI decide.");
@@ -1675,7 +1867,10 @@ void composerBody(float dt) {
         ImVec4(COL_ACCENT.x * 0.75f, COL_ACCENT.y * 0.75f, COL_ACCENT.z * 0.75f, 1.f));
     // Manual provider: "Send" becomes "Copy prompt for AI" (no network).
     const char* genLabel = manualProv ? "Copy prompt for AI" : "Send";
-    bool clicked = ImGui::Button(genLabel, ImVec2(manualProv ? 180 : 110, 30));
+    // Phones: one full-width primary button at the bottom of the pane.
+    bool clicked = mobile
+        ? ImGui::Button(genLabel, ImVec2(-1.f, kTouchTarget + 4.f))
+        : ImGui::Button(genLabel, ImVec2(manualProv ? 180 : 110, 30));
     if ((clicked || (sendNow && can)) && can) {
         std::string err;
         bool replace = g_st.genTarget == -2 ? true : g_st.genReplace;
@@ -1725,8 +1920,9 @@ void composerBody(float dt) {
     ImGui::PopStyleColor(2);
     // Manual: once a prompt is copied, offer Build-from-clipboard.
     if (manualProv && editoraiManualPending()) {
-        ImGui::SameLine();
-        if (ImGui::Button("Build from clipboard", ImVec2(180, 30))) {
+        if (!mobile) ImGui::SameLine();
+        if (ImGui::Button("Build from clipboard",
+                mobile ? ImVec2(-1.f, kTouchTarget) : ImVec2(180, 30))) {
             std::string err;
             if (editoraiManualBuild(err)) {
                 g_st.pendingSelectAfter = 0;
@@ -1739,7 +1935,7 @@ void composerBody(float dt) {
     ImGui::EndDisabled();
     tipIfHovered("Start building. You can close this panel - or even the "
                  "editor - while it runs. (Ctrl+Enter also sends.)");
-    ImGui::SameLine();
+    if (!mobile) ImGui::SameLine();
     if (!can) {
         ImGui::TextColored(COL_DIM, "describe the level first");
     } else {
@@ -1757,6 +1953,212 @@ void composerBody(float dt) {
             g_st.genError.clear();  // keep state self-consistent post-TTL
         }
     }
+
+    if (mobile) {
+        touchScroll();
+        ImGui::EndChild();
+    }
+}
+
+// ── Phone chat: one pane at a time ──────────────────────────────────────────
+// The desktop layout puts a 210 px session column beside the conversation; a
+// phone has no room for that, so the list becomes a drawer and the
+// conversation (or the composer) owns the whole tab. Every control here is at
+// least 44 dp tall and the transcript/rating actions sit near the bottom, in
+// thumb reach.
+void chatTabMobile(float dt) {
+    auto& sessions = genSessions();
+    const ImGuiStyle& style = ImGui::GetStyle();
+
+    float fullW  = std::max(ImGui::GetContentRegionAvail().x, 100.f);
+    float halfW  = std::max((fullW - style.ItemSpacing.x) * 0.5f, 60.f);
+    if (ImGui::Button(g_st.mobileListOpen ? "chat  ^" : "sessions  v",
+                      ImVec2(halfW, kTouchTarget)))
+        g_st.mobileListOpen = !g_st.mobileListOpen;
+    ImGui::SameLine();
+    if (ImGui::Button("+  new chat", ImVec2(halfW, kTouchTarget))) {
+        g_st.composing = true;
+        g_st.mobileListOpen = false;
+    }
+
+    // ── Sessions drawer ─────────────────────────────────────────────────────
+    if (g_st.mobileListOpen) {
+        ImGui::BeginChild("mlist", ImVec2(0, 0), ImGuiChildFlags_None);
+        bool anyFinished = false;
+        for (auto& s : sessions)
+            if (s && (s->state == GenSession::State::Done ||
+                      s->state == GenSession::State::Failed)) {
+                anyFinished = true;
+                break;
+            }
+        if (anyFinished &&
+            ImGui::Button("clear finished", ImVec2(-1.f, kTouchTarget))) {
+            auto& all = genSessions();
+            all.erase(std::remove_if(all.begin(), all.end(), [](auto& s) {
+                return !s || s->state == GenSession::State::Done ||
+                             s->state == GenSession::State::Failed;
+            }), all.end());
+            editoraiMarkSessionsDirty();
+        }
+        if (sessions.empty()) {
+            ImGui::Spacing();
+            ImGui::TextColored(COL_DIM,
+                "No sessions yet. Start one with '+ new chat'.");
+        }
+        int64_t nowSecs = (int64_t)std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        for (int i = (int)sessions.size() - 1; i >= 0; --i) {
+            auto& s = sessions[i];
+            if (!s) continue;
+            ImGui::PushID(i);
+            bool sel = !g_st.composing && g_st.selectedSessionId == s->id;
+            if (sessionRow(*s, sel, nowSecs)) {
+                g_st.composing = false;
+                g_st.pendingSelectAfter = -1;   // explicit pick beats auto-jump
+                g_st.mobileListOpen = false;
+                if (g_st.selectedSessionId != s->id) {
+                    g_st.selectedSessionId = s->id;
+                    memset(g_st.chatInput, 0, sizeof(g_st.chatInput));
+                }
+            }
+            ImGui::PopID();
+        }
+        touchScroll();
+        ImGui::EndChild();
+        return;
+    }
+
+    // Composer owns the pane; it scrolls itself.
+    if (g_st.composing) {
+        composerBody(dt);
+        return;
+    }
+
+    // ── Conversation ────────────────────────────────────────────────────────
+    std::shared_ptr<GenSession> sel;
+    for (auto& s : sessions)
+        if (s && s->id == g_st.selectedSessionId) { sel = s; break; }
+    if (!sel && g_st.pendingSelectAfter < 0)
+        for (int i = (int)sessions.size() - 1; i >= 0; --i)
+            if (sessions[i]) {
+                sel = sessions[i];
+                g_st.selectedSessionId = sel->id;
+                memset(g_st.chatInput, 0, sizeof(g_st.chatInput));
+                break;
+            }
+
+    bool showRating = sel && sel->needsRating;
+    bool showRetry  = sel && !showRating && !sel->fbPrompt.empty() &&
+                      (sel->state == GenSession::State::Done ||
+                       sel->state == GenSession::State::Failed);
+
+    // Reserve exactly what the footer below draws, so the transcript never
+    // hides behind it and its scroll range reaches the newest message.
+    const float sp     = style.ItemSpacing.y;
+    const float rowH   = std::max(kTouchTarget, ImGui::GetFrameHeight());
+    const float inputH = ImGui::GetFrameHeight();
+    float reserve = inputH + sp + rowH;
+    if (sel) reserve += rowH + sp;
+    if (showRating)
+        reserve += ImGui::GetTextLineHeight() + sp +
+                   2.f * (kTouchTarget + sp) + rowH + sp;
+
+    ImGui::BeginChild("transcript", ImVec2(0, -reserve),
+                      ImGuiChildFlags_Borders);
+    if (sel) {
+        bool pinBottom = ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4.f;
+        const size_t visibleEntries = 80;
+        size_t start = sel->transcript.size() > visibleEntries
+            ? sel->transcript.size() - visibleEntries : 0;
+        if (start > 0)
+            ImGui::TextColored(COL_DIM, "(%d older entries not shown)",
+                               (int)start);
+        for (size_t i = start; i < sel->transcript.size(); ++i)
+            renderEntry(sel->transcript[i], (int)i);
+        if (sel->state == GenSession::State::Running && !sel->liveStatus.empty()) {
+            ImGui::Spacing();
+            ImGui::TextColored(COL_DIM, "AI %s", sel->liveStatus.c_str());
+        }
+        if (pinBottom) ImGui::SetScrollHereY(1.0f);
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_DIM);
+        ImGui::TextWrapped(g_st.pendingSelectAfter >= 0
+            ? "Starting..." : "Select a session.");
+        ImGui::PopStyleColor();
+    }
+    touchScroll();
+    ImGui::EndChild();
+
+    // ── Secondary actions (export / retry) ──────────────────────────────────
+    if (sel) {
+        float avail = ImGui::GetContentRegionAvail().x;
+        float bw = showRetry ? (avail - sp) * 0.5f : avail;
+        if (showRetry) {
+            if (ImGui::Button("retry", ImVec2(bw, rowH))) {
+                snprintf(g_st.genPrompt, sizeof(g_st.genPrompt), "%s",
+                         sel->fbPrompt.c_str());
+                editoraiSetSavedStr("ov-gen-prompt", g_st.genPrompt);
+                g_st.composing = true;
+                g_st.mobileListOpen = false;
+            }
+            ImGui::SameLine();
+            bw = avail - bw - sp;
+        }
+        if (ImGui::Button("export", ImVec2(bw, rowH))) {
+            std::string err;
+            if (editoraiExportSession(sel, err))
+                ImGui::SetTooltip("%s", err.c_str());
+        }
+    }
+
+    // ── Rating: two rows of five thumb-sized buttons + skip ─────────────────
+    if (showRating) {
+        ImGui::TextColored(COL_ACCENT, "Rate it - it teaches the AI your taste");
+        float gridW = ImGui::GetContentRegionAvail().x;
+        float bw = (gridW - 4.f * sp) / 5.f;
+        for (int r = 1; r <= 10; ++r) {
+            if (r > 1 && (r - 1) % 5 != 0) ImGui::SameLine();
+            ImGui::PushID(900 + r);
+            if (ImGui::Button(std::to_string(r).c_str(),
+                              ImVec2(bw, kTouchTarget)))
+                editoraiRateSession(sel, r);
+            ImGui::PopID();
+        }
+        if (ImGui::Button("skip rating", ImVec2(-1.f, rowH))) {
+            sel->needsRating = false;
+            editoraiMarkSessionsDirty();  // skip must survive restarts too
+        }
+    }
+
+    // ── Message + mode + send ───────────────────────────────────────────────
+    ImGui::SetNextItemWidth(-1.f);
+    bool enter = ImGui::InputTextWithHint("##chat", "message the AI...",
+        g_st.chatInput, sizeof(g_st.chatInput),
+        ImGuiInputTextFlags_EnterReturnsTrue | TEXT_SELECTION_FLAGS,
+        textSelectionCallback);
+    ownsDragIfHovered();
+
+    static const char* MODES[] = {"Edit", "Plan", "Chat"};
+    float availW = ImGui::GetContentRegionAvail().x;
+    float comboW = std::min(140.f, availW * 0.36f);
+    ImGui::SetNextItemWidth(comboW);
+    if (ImGui::Combo("##chatmode", &g_st.chatMode, MODES, 3))
+        editoraiSetSavedInt("ov-chat-mode", g_st.chatMode);
+    ImGui::SameLine();
+    bool running = sel && sel->state == GenSession::State::Running;
+    float sendW = std::max(availW - comboW - sp, 80.f);
+    if (running) {
+        if (ImGui::Button("Cancel", ImVec2(sendW, rowH)))
+            editoraiCancelSession(sel);
+    } else {
+        bool can = sel && g_st.chatInput[0] != '\0';
+        ImGui::BeginDisabled(!can);
+        if ((ImGui::Button("Send", ImVec2(sendW, rowH)) || enter) && can) {
+            editoraiSendFollowUp(sel, g_st.chatInput, g_st.chatMode);
+            memset(g_st.chatInput, 0, sizeof(g_st.chatInput));
+        }
+        ImGui::EndDisabled();
+    }
 }
 
 // ── Tab: Settings ─────────────────────────────────────────────────────────────
@@ -1770,7 +2172,7 @@ void tabSettings() {
         "ministral", "huggingface", "deepseek", "groq", "ollama",
         "lm-studio", "llama-cpp", "custom"};
 
-    ImGui::BeginChild("settingsScroll", ImVec2(0, 0));
+    ImGui::BeginChild("settingsScroll", ImVec2(0, 0), ImGuiChildFlags_None);
 
     if (ImGui::CollapsingHeader("Provider", ImGuiTreeNodeFlags_DefaultOpen)) {
         // Provider picker with local-backend auto-detect tags.
@@ -1778,14 +2180,15 @@ void tabSettings() {
             std::string detected = editoraiDetectedBackends();
             std::string curP = editoraiGetStr("ai-provider");
             const char* preview = curP.empty() ? "(none)" : curP.c_str();
-            ImGui::SetNextItemWidth(210.f);
+            ImGui::SetNextItemWidth(uiMobile()
+                ? -1.f : std::min(210.f, ImGui::GetContentRegionAvail().x));
             if (ImGui::BeginCombo("provider##provider", preview)) {
                 for (auto* opt : PROVIDERS) {
                     bool sel = curP == opt;
                     std::string label = opt;
                     if (detected.find(opt) != std::string::npos)
                         label += "  (detected)";
-                    if (ImGui::Selectable(label.c_str(), sel))
+                    if (selectRow(label.c_str(), sel))
                         editoraiSetStr("ai-provider", opt);
                     if (sel) ImGui::SetItemDefaultFocus();
                 }
@@ -1812,8 +2215,9 @@ void tabSettings() {
         {
             // Test connection — a real authenticated probe of the current
             // provider (the same endpoints the AI generation calls).
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Test connection")) editoraiTestProvider();
+            if (!uiMobile()) ImGui::SameLine();
+            if (smallAction("Test connection", uiMobile() ? -1.f : 0.f))
+                editoraiTestProvider();
             tipIfHovered("Sends a tiny authenticated request to this provider "
                          "to confirm the key/URL work before you generate.");
             std::string tstat = editoraiTestStatus();
@@ -1859,7 +2263,8 @@ void tabSettings() {
         // One-click sign-in where the provider supports it — no key-copying.
         if (editoraiOAuthAvailable(p)) {
             ImGui::BeginDisabled(editoraiOAuthActive());
-            if (ImGui::Button("Sign in with browser"))
+            if (ImGui::Button("Sign in with browser",
+                    uiMobile() ? ImVec2(-1.f, kTouchTarget) : ImVec2(0, 0)))
                 editoraiOAuthStart(p);
             ImGui::EndDisabled();
             tipIfHovered("Opens the provider's login page; the key/token is "
@@ -1989,7 +2394,7 @@ void tabSettings() {
             tipIfHovered("Click the swatch for a picker, or drag the R/G/B "
                          "numbers like sliders.");
         }
-        if (ImGui::SmallButton("reset theme")) {
+        if (smallAction("reset theme", uiMobile() ? -1.f : 0.f)) {
             for (auto& s : THEME_SLOTS) {
                 *s.col = s.def;
                 editoraiSetSavedStr(s.key, vecToHex(s.def));
@@ -2030,14 +2435,14 @@ void tabSettings() {
                 // A 3-key sequence auto-commits in the hook; for 1-2 keys the
                 // user clicks save. Esc (in the hook) or Cancel here aborts.
                 ImGui::BeginDisabled(g_keyCapturePending.empty());
-                if (ImGui::SmallButton("save")) {
+                if (smallAction("save")) {
                     commitToggleSeq(g_keyCapturePending);
                     g_keyCapturePending.clear();
                     g_keyCapture = false;
                 }
                 ImGui::EndDisabled();
                 ImGui::SameLine();
-                if (ImGui::SmallButton("cancel")) {
+                if (smallAction("cancel")) {
                     g_keyCapturePending.clear();
                     g_keyCapture = false;
                 }
@@ -2053,6 +2458,7 @@ void tabSettings() {
             "paste API keys or model IDs).");
     }
 
+    touchScroll();
     ImGui::EndChild();
 }
 
@@ -2062,6 +2468,18 @@ void drawOverlay() {
     if (!g_themeLoaded) loadTheme();
     if (!g_st.persistedLoaded) loadPersistedInputs();
     applyThemeFrame();
+
+#ifdef GEODE_IS_MOBILE
+    // First-tap reliability: gd-imgui-cocos only forwards a touch to ImGui when
+    // ImGui captured the mouse on the PREVIOUS frame, so the first tap on an
+    // uncaptured window falls through to the game. A full-screen panel must
+    // own every touch, so switch to Blocking while it is open (or fading) and
+    // hand control back the moment it is gone.
+    ImGuiCocos::get().setInputMode(
+        (g_st.panelOpen || g_animT > 0.05f)
+            ? ImGuiCocos::InputMode::Blocking
+            : ImGuiCocos::InputMode::Default);
+#endif
 
     // Background ticks that must run even with the panel closed.
     editoraiOAuthTick(dt);
@@ -2084,12 +2502,19 @@ void drawOverlay() {
     // or still fading: the full-screen panel covers it, so submitting a
     // second window every frame is wasted work on phones.
     if (uiMobile() && !PlayLayer::get() && !g_st.panelOpen && g_animT <= 0.05f) {
-        ImGui::SetNextWindowPos(ImVec2(8, 60), ImGuiCond_FirstUseEver);
+        // 56 dp bubble, clear of the top-left corner buttons. It opens on
+        // HOVER as well as a click: the first touch of an uncaptured window
+        // never reaches ImGui as a click (previous-frame gating), but its
+        // position does, so a light tap still opens the panel on the first try.
+        ImGui::SetNextWindowPos(ImVec2(8, 96), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowBgAlpha(0.85f);
         if (ImGui::Begin("##eaibubble", nullptr,
                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
-                ImGuiWindowFlags_NoCollapse)) {
-            if (ImGui::Button("AI", ImVec2(44, 44)))
-                g_st.panelOpen = !g_st.panelOpen;
+                ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove |
+                ImGuiWindowFlags_NoSavedSettings |
+                ImGuiWindowFlags_NoFocusOnAppearing)) {
+            if (ImGui::Button("AI", ImVec2(56, 56)) || ImGui::IsWindowHovered())
+                g_st.panelOpen = true;
         }
         ImGui::End();
     }
@@ -2118,7 +2543,7 @@ void drawOverlay() {
                 bool blocked = PlayLayer::get() != nullptr ||
                                LevelEditorLayer::get() != nullptr;
                 ImGui::BeginDisabled(blocked);
-                if (ImGui::SmallButton("go to level"))
+                if (smallAction("go to level"))
                     editoraiGoToSessionLevel(waiting);
                 ImGui::EndDisabled();
                 if (blocked && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -2172,8 +2597,21 @@ void drawOverlay() {
     const auto* viewport = ImGui::GetMainViewport();
     bool mobile = uiMobile();
     if (mobile) {
+        // Android IMEs either shrink the surface (DisplaySize follows) or
+        // overlay it. Remember the tallest viewport seen without a text field
+        // focused; if the keyboard is up and the surface did NOT shrink, lift
+        // the panel ourselves so the composer/input stays visible above it.
+        static float s_fullH = 0.f;
+        float displayH = ImGui::GetIO().DisplaySize.y;
+        if (!ImGui::GetIO().WantTextInput)
+            s_fullH = std::max(s_fullH, displayH);
+        float inset = 0.f;
+        if (ImGui::GetIO().WantTextInput && s_fullH > 1.f &&
+            displayH > s_fullH * 0.9f)
+            inset = std::clamp(s_fullH * 0.42f, 160.f, 420.f);
         ImGui::SetNextWindowPos(viewport->WorkPos, ImGuiCond_Always);
-        ImGui::SetNextWindowSize(viewport->WorkSize, ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(viewport->WorkSize.x,
+            std::max(viewport->WorkSize.y - inset, 240.f)), ImGuiCond_Always);
     } else {
         ImGui::SetNextWindowSize(ImVec2(760, 460), ImGuiCond_FirstUseEver);
     }
@@ -2188,8 +2626,13 @@ void drawOverlay() {
     // (Alpha only affects rendering) — drop mouse input so it can't swallow
     // clicks meant for the game.
     ImGuiWindowFlags animFlags = !g_st.panelOpen ? ImGuiWindowFlags_NoMouseInputs : 0;
-    if (mobile) animFlags |= ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize;
-    if (!ImGui::Begin("EditorAI", &open, animFlags)) {
+    if (mobile)
+        animFlags |= ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
+                     ImGuiWindowFlags_NoSavedSettings;
+    // Mobile draws its own header row with a 44 dp close button (the stock
+    // title-bar X is only FontSize square — a hard target to hit).
+    if (!ImGui::Begin("EditorAI", mobile ? nullptr : &open, animFlags)) {
         ImGui::End();
         ImGui::PopStyleVar();
         return;
@@ -2230,15 +2673,27 @@ void drawOverlay() {
         else
             ImGui::TextColored(COL_DIM, "idle");
 
-        // Right-aligned dismiss hint, out of the reading path.
-        std::string hint = uiMobile()
-            ? std::string("bubble / X hides")
-            : fmt::format("{} hides", keySeqDisplayName(overlayToggleSeq()));
-        float hw = ImGui::CalcTextSize(hint.c_str()).x;
-        ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 20.f,
-                                 ImGui::GetContentRegionMax().x - hw));
-        ImGui::TextColored(ImVec4(COL_DIM.x, COL_DIM.y, COL_DIM.z, 0.65f),
-                           "%s", hint.c_str());
+        // Right-aligned dismiss control, out of the reading path.
+        if (mobile) {
+            // 44 dp close target instead of the tiny stock title-bar X.
+            ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 12.f,
+                                     ImGui::GetContentRegionMax().x - 44.f));
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                ImVec4(COL_ERR.x * 0.50f, COL_ERR.y * 0.50f, COL_ERR.z * 0.50f, 1.f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                ImVec4(COL_ERR.x * 0.70f, COL_ERR.y * 0.70f, COL_ERR.z * 0.70f, 1.f));
+            if (ImGui::Button("X", ImVec2(44, 44)))
+                g_st.panelOpen = false;
+            ImGui::PopStyleColor(2);
+        } else {
+            std::string hint = fmt::format("{} hides",
+                                           keySeqDisplayName(overlayToggleSeq()));
+            float hw = ImGui::CalcTextSize(hint.c_str()).x;
+            ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 20.f,
+                                     ImGui::GetContentRegionMax().x - hw));
+            ImGui::TextColored(ImVec4(COL_DIM.x, COL_DIM.y, COL_DIM.z, 0.65f),
+                               "%s", hint.c_str());
+        }
     }
 
     if (ImGui::BeginTabBar("##tabs")) {
@@ -2461,6 +2916,20 @@ static void editoraiOverlaySetup() {
         style.FrameBorderSize   = 0.f;
         style.TabBarBorderSize  = 0.f;
         // Colors come from applyThemeFrame() every frame (user-tunable).
+        // ── Phones: touch-first metrics ────────────────────────────────────
+        // Bigger glyphs, fat padding (every framed control becomes ≈44 dp
+        // tall), wide scrollbars, and a few dp of hit-test slop. Desktop keeps
+        // exactly the values above.
+        if (uiMobile()) {
+            style.FontScaleMain     = 1.15f;
+            style.FramePadding      = ImVec2(12, 11);
+            style.ItemSpacing       = ImVec2(10, 10);
+            style.ItemInnerSpacing  = ImVec2(8, 8);
+            style.WindowPadding     = ImVec2(14, 14);
+            style.ScrollbarSize     = 26.f;
+            style.GrabMinSize       = 24.f;
+            style.TouchExtraPadding = ImVec2(4, 4);
+        }
     }).draw([] {
         drawOverlay();
     });
