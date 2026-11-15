@@ -41,7 +41,7 @@ jobs:
         with:
           # `latest` matches multi-platform.yml, so the artifact is the same
           # SDK as a normal CI build. Use `given` to pin to mod.json's geode.
-          sdk: "latest"
+          sdk: "5.10.1"
           combine: true
           target: ${{ matrix.config.target }}
 
