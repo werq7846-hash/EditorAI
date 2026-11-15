@@ -1,0 +1,64 @@
+name: Build Android
+
+# Android-only build, for quickly producing an installable .geode while
+# iterating on the touch UI. The full multi-platform workflow still exists
+# (multi-platform.yml); drop the `push` block below if you do not want both
+# running on the same commit.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "**"
+    paths:
+      - "src/**"
+      - "resources/**"
+      - "CMakeLists.txt"
+      - "mod.json"
+      - ".github/workflows/android.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: Android32
+            target: Android32
+          - name: Android64
+            target: Android64
+
+    name: ${{ matrix.config.name }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the mod
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          # `latest` matches multi-platform.yml, so the artifact is the same
+          # SDK as a normal CI build. Use `given` to pin to mod.json's geode.
+          sdk: "latest"
+          combine: true
+          target: ${{ matrix.config.target }}
+
+  package:
+    name: Package Android .geode
+    runs-on: ubuntu-latest
+    needs: ["build"]
+
+    steps:
+      # Merges the 32- and 64-bit artifacts into one .geode (and deletes the
+      # temporary geode-build-* artifacts). With only Android present this
+      # yields an Android-only package, which installs fine on Android.
+      - uses: geode-sdk/build-geode-mod/combine@main
+        id: build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EditorAI-android
+          path: ${{ steps.build.outputs.build-output }}
+          retention-days: 14
