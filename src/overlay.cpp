@@ -375,6 +375,10 @@ void tipIfHovered(const char* tip) {
 // ── Settings widgets (write-through to mod settings; every one has a tip) ───
 void settingToggle(const char* label, const char* id, const char* tip = nullptr) {
     bool v = editoraiGetBool(id);
+    // Scope the widget ID by setting id instead of formatting
+    // "<label>##<id>" every frame — the label alone is usually not unique
+    // across rows, and fmt::format would allocate once per row per frame.
+    ImGui::PushID(id);
     if (uiMobile()) {
         // Phones: the whole row is the switch. Checkbox labels cannot wrap, so
         // long labels would run off the screen; this lays the text out with
@@ -384,8 +388,7 @@ void settingToggle(const char* label, const char* id, const char* tip = nullptr)
         ImVec2 textSize = ImGui::CalcTextSize(label, nullptr, false, textW);
         float rowH = std::max(52.f, textSize.y + 24.f);
         ImVec2 p = ImGui::GetCursorScreenPos();
-        ImGui::InvisibleButton(fmt::format("##toggle-{}", id).c_str(),
-                               ImVec2(avail, rowH));
+        ImGui::InvisibleButton("##toggle", ImVec2(avail, rowH));
         bool hovered = ImGui::IsItemHovered();
         if (ImGui::IsItemClicked()) {
             v = !v;
@@ -407,22 +410,25 @@ void settingToggle(const char* label, const char* id, const char* tip = nullptr)
                            pMin.y + (30.f - ss.y) * 0.5f),
                     IM_COL32(14, 15, 20, 255), state);
         tipIfHovered(tip);
+        ImGui::PopID();
         return;
     }
-    if (ImGui::Checkbox(fmt::format("{}##{}", label, id).c_str(), &v))
+    if (ImGui::Checkbox(label, &v))
         editoraiSetBool(id, v);
     tipIfHovered(tip);
+    ImGui::PopID();
 }
 
 void settingInt(const char* label, const char* id, int mn, int mx,
                 const char* tip = nullptr, ImGuiSliderFlags flags = 0) {
     int v = (int)editoraiGetInt(id);
     ImGui::SetNextItemWidth(std::min(170.f, ImGui::GetContentRegionAvail().x));
-    if (ImGui::SliderInt(fmt::format("{}##{}", label, id).c_str(), &v, mn, mx,
-                         "%d", flags))
+    ImGui::PushID(id);
+    if (ImGui::SliderInt(label, &v, mn, mx, "%d", flags))
         editoraiSetInt(id, (int64_t)v);
     ownsDragIfHovered();
     tipIfHovered(tip);
+    ImGui::PopID();
 }
 
 // Text settings keep a per-id edit buffer; the live value re-syncs whenever
@@ -468,6 +474,21 @@ std::vector<EndpointProfile> loadEndpointProfiles() {
     return out;
 }
 
+// Parsed profile cache. The Settings tab renders this section every frame,
+// and re-parsing the saved JSON (plus copying every field) each frame showed
+// up as steady garbage on phones. The cache is refreshed whenever this file
+// writes the list; nothing else touches the saved key.
+std::vector<EndpointProfile> s_endpointProfileCache;
+bool s_endpointProfilesLoaded = false;
+
+const std::vector<EndpointProfile>& endpointProfiles() {
+    if (!s_endpointProfilesLoaded) {
+        s_endpointProfileCache = loadEndpointProfiles();
+        s_endpointProfilesLoaded = true;
+    }
+    return s_endpointProfileCache;
+}
+
 void saveEndpointProfiles(const std::vector<EndpointProfile>& profiles) {
     auto arr = matjson::Value::array();
     for (auto& p : profiles) {
@@ -477,12 +498,14 @@ void saveEndpointProfiles(const std::vector<EndpointProfile>& profiles) {
         arr.push(std::move(e));
     }
     editoraiSetSavedStr("custom-endpoint-profiles", arr.dump());
+    s_endpointProfileCache = profiles;
+    s_endpointProfilesLoaded = true;
 }
 
 void endpointProfilesWidget() {
     static std::string selected;
     static std::array<char, 64> newName{};
-    auto profiles = loadEndpointProfiles();
+    const auto& profiles = endpointProfiles();
     if (!selected.empty() && std::none_of(profiles.begin(), profiles.end(),
             [&](const EndpointProfile& p) { return p.name == selected; }))
         selected.clear();
@@ -514,9 +537,13 @@ void endpointProfilesWidget() {
     }
     if (!uiMobile()) ImGui::SameLine();
     if (smallAction("Delete", uiMobile() ? -1.f : 0.f)) {
-        profiles.erase(std::remove_if(profiles.begin(), profiles.end(),
-            [&](const EndpointProfile& p) { return p.name == selected; }), profiles.end());
-        saveEndpointProfiles(profiles);
+        // Copy-on-write: the cached list is shared, so build the new list
+        // only when the user actually deletes.
+        std::vector<EndpointProfile> next;
+        next.reserve(profiles.size());
+        for (auto& p : profiles)
+            if (p.name != selected) next.push_back(p);
+        saveEndpointProfiles(next);
         selected.clear();
     }
     ImGui::EndDisabled();
@@ -536,12 +563,14 @@ void endpointProfilesWidget() {
                 editoraiGetStr("custom-provider-model"),
                 editoraiGetStr("custom-provider-auth"),
                 editoraiGetStr("custom-provider-api-key")};
-            auto it = std::find_if(profiles.begin(), profiles.end(),
+            // Same copy-on-write rule as Delete.
+            std::vector<EndpointProfile> next = profiles;
+            auto it = std::find_if(next.begin(), next.end(),
                 [&](const EndpointProfile& p) { return p.name == name; });
-            if (it == profiles.end()) {
-                if (profiles.size() < 20) profiles.push_back(std::move(current));
+            if (it == next.end()) {
+                if (next.size() < 20) next.push_back(std::move(current));
             } else *it = std::move(current);
-            saveEndpointProfiles(profiles);
+            saveEndpointProfiles(next);
             selected = name;
             newName.fill(0);
         }
@@ -565,13 +594,15 @@ void settingText(const char* label, const std::string& id,
     ImGui::SetNextItemWidth(uiMobile()
         ? -1.f
         : std::min(280.f, ImGui::GetContentRegionAvail().x));
-    ImGui::InputTextWithHint(fmt::format("{}##{}", label, id).c_str(), hint,
+    ImGui::PushID(id.c_str());
+    ImGui::InputTextWithHint(label, hint,
         tb.buf.data(), tb.buf.size(), TEXT_SELECTION_FLAGS |
         (secret ? ImGuiInputTextFlags_Password : ImGuiInputTextFlags_None),
         textSelectionCallback);
     ownsDragIfHovered();
     tb.editing = ImGui::IsItemActive();
     tipIfHovered(tip);
+    ImGui::PopID();
     if (ImGui::IsItemDeactivatedAfterEdit()) {
         editoraiSetStr(id.c_str(), tb.buf.data());
         if (autoBypass && tb.buf[0]) {
@@ -587,7 +618,8 @@ void settingCombo(const char* label, const char* id,
     std::string cur = editoraiGetStr(id);
     const char* preview = cur.empty() ? "(none)" : cur.c_str();
     ImGui::SetNextItemWidth(std::min(210.f, ImGui::GetContentRegionAvail().x));
-    if (ImGui::BeginCombo(fmt::format("{}##{}", label, id).c_str(), preview)) {
+    ImGui::PushID(id);
+    if (ImGui::BeginCombo(label, preview)) {
         for (auto* opt : options) {
             bool sel = cur == opt;
             if (selectRow(*opt ? opt : "(none)", sel))
@@ -597,6 +629,7 @@ void settingCombo(const char* label, const char* id,
         ImGui::EndCombo();
     }
     tipIfHovered(tip);
+    ImGui::PopID();
 }
 
 // ── Quality presets ───────────────────────────────────────────────────────────
@@ -872,15 +905,24 @@ void drawSpans(const std::vector<Span>& spans, float wrapW,
         atLineStart = true;
     };
 
+    // Per-word scratch. The old loop built two std::strings per word (the
+    // word, then word+space) for every marked-up line, every frame — on a
+    // long transcript that is hundreds of allocations per frame. Words are
+    // short, so a stack buffer covers nearly all of them; `scratch` only
+    // serves the rare over-long token.
+    char        wbuf[192];
+    std::string scratch;
+
     for (auto& sp : spans) {
         // Split into words so wrapping can happen between them.
         size_t p = 0;
         while (p < sp.text.size()) {
             size_t sp1 = sp.text.find(' ', p);
-            std::string word = sp.text.substr(
-                p, sp1 == std::string::npos ? std::string::npos : sp1 - p);
-            bool trailingSpace = sp1 != std::string::npos;
-            p = (sp1 == std::string::npos) ? sp.text.size() : sp1 + 1;
+            std::string_view word = std::string_view(sp.text).substr(
+                p, sp1 == std::string_view::npos
+                       ? std::string_view::npos : sp1 - p);
+            bool trailingSpace = sp1 != std::string_view::npos;
+            p = (sp1 == std::string_view::npos) ? sp.text.size() : sp1 + 1;
             if (word.empty()) {
                 if (trailingSpace && !atLineStart) {
                     float w = ImGui::CalcTextSize(" ").x;
@@ -893,16 +935,27 @@ void drawSpans(const std::vector<Span>& spans, float wrapW,
                 }
                 continue;
             }
-            std::string draw = word + (trailingSpace ? " " : "");
-            float w = ImGui::CalcTextSize(draw.c_str()).x;
+            size_t need = word.size() + (trailingSpace ? 1u : 0u);
+            const char* draw;
+            if (need < sizeof(wbuf)) {
+                memcpy(wbuf, word.data(), word.size());
+                if (trailingSpace) wbuf[word.size()] = ' ';
+                wbuf[need] = '\0';
+                draw = wbuf;
+            } else {
+                scratch.assign(word.data(), word.size());
+                if (trailingSpace) scratch.push_back(' ');
+                draw = scratch.c_str();
+            }
+            float w = ImGui::CalcTextSize(draw).x;
             if (!atLineStart && w > lineLeft) newline();
             if (!atLineStart) ImGui::SameLine(0.f, 0.f);
             // Long unbreakable token (a URL or a base64 blob): hard-slice it
             // so it can never push the layout past the panel edge.
             if (w > wrapW && wrapW > 8.f) {
                 std::string chunk;
-                for (char ch : draw) {
-                    chunk += ch;
+                for (const char* c = draw; *c; ++c) {
+                    chunk += *c;
                     if (ImGui::CalcTextSize(chunk.c_str()).x >= wrapW - 4.f) {
                         if (sp.code) {
                             ImGui::PushStyleColor(ImGuiCol_Text, codeCol);
@@ -943,13 +996,13 @@ void drawSpans(const std::vector<Span>& spans, float wrapW,
             if (sp.code) {
                 // Subtle plate behind inline code so it reads as code.
                 ImVec2 pos = ImGui::GetCursorScreenPos();
-                ImVec2 sz  = ImGui::CalcTextSize(draw.c_str());
+                ImVec2 sz  = ImGui::CalcTextSize(draw);
                 ImGui::GetWindowDrawList()->AddRectFilled(
                     ImVec2(pos.x - 1.f, pos.y),
                     ImVec2(pos.x + sz.x + 1.f, pos.y + sz.y),
                     ImGui::GetColorU32(ImVec4(1.f, 1.f, 1.f, 0.09f)), 2.f);
             }
-            ImGui::TextColored(col, "%s", draw.c_str());
+            ImGui::TextColored(col, "%s", draw);
             lineLeft -= w;
             atLineStart = false;
             if (lineLeft <= 0.f) newline();
@@ -1091,14 +1144,19 @@ void render(std::string_view text, const ImVec4& baseCol, float wrapW) {
                         (trimmed[numLen] == '.' || trimmed[numLen] == ')') &&
                         trimmed[numLen + 1] == ' ';
         if (bullet || numbered) {
-            std::string marker = bullet
-                ? std::string("\u2022 ")
-                : std::string(trimmed.substr(0, numLen + 1)) + " ";
+            // Stack buffer — list markers were a std::string allocation per
+            // bullet line per frame.
+            char marker[32];
+            if (bullet)
+                snprintf(marker, sizeof(marker), "%s", "\u2022 ");
+            else
+                snprintf(marker, sizeof(marker), "%.*s ",
+                         (int)(numLen + 1), trimmed.data());
             std::string_view body = trimmed.substr(bullet ? 2 : numLen + 2);
             ImGui::SetCursorPosX(baseX);
-            ImGui::TextColored(COL_DIM, "%s", marker.c_str());
+            ImGui::TextColored(COL_DIM, "%s", marker);
             ImGui::SameLine(0.f, 0.f);
-            float markerW = ImGui::CalcTextSize(marker.c_str()).x;
+            float markerW = ImGui::CalcTextSize(marker).x;
             drawSpans(inlineSpans(body), std::max(wrapW - markerW, 40.f), baseCol);
             continue;
         }
@@ -1150,7 +1208,8 @@ void settingModelCombo(const char* id,
     const char* preview = custom ? "custom..."
                         : (cur.empty() ? "(none)" : cur.c_str());
     ImGui::SetNextItemWidth(210.f);
-    if (ImGui::BeginCombo(fmt::format("model##{}", id).c_str(), preview)) {
+    ImGui::PushID(id);
+    if (ImGui::BeginCombo("model", preview)) {
         for (auto* opt : presets) {
             bool sel = !custom && cur == opt;
             if (selectRow(opt, sel)) { editoraiSetStr(id, opt); custom = false; }
@@ -1161,6 +1220,7 @@ void settingModelCombo(const char* id,
         ImGui::EndCombo();
     }
     tipIfHovered(tip);
+    ImGui::PopID();
     if (custom)
         settingText("custom id", id, "type any model id", false,
                     "Any model id this provider accepts.", true);
@@ -1176,8 +1236,10 @@ void ollamaModelSelector() {
     if (!s_autoFetched) { s_autoFetched = true; editoraiRefreshOllamaModels(); }
 
     bool platinum = editoraiGetBool("use-platinum");
-    std::vector<std::string> models;
-    int state = editoraiGetOllamaModels(models);   // 0 none,1 loading,2 empty,3 have,4 error
+    int state = 0;
+    // Reference, not a copy: this widget runs every frame while Settings is
+    // open and the list can hold dozens of tags.
+    const std::vector<std::string>& models = editoraiGetOllamaModels(state);
     std::string cur = editoraiGetStr("ollama-model");
 
     const char* preview = cur.empty() ? "(pick a model)" : cur.c_str();
@@ -1570,7 +1632,9 @@ void tabChat(float dt) {
         for (int r = 1; r <= 10; ++r) {
             ImGui::SameLine();
             ImGui::PushID(900 + r);
-            if (smallAction(std::to_string(r).c_str()))
+            char rLabel[4];
+            snprintf(rLabel, sizeof(rLabel), "%d", r);
+            if (smallAction(rLabel))
                 editoraiRateSession(sel, r);
             ImGui::PopID();
         }
@@ -1692,11 +1756,11 @@ void composerBody(float dt) {
         editoraiSetSavedStr("ov-gen-prompt", g_st.genPrompt);
 
     // ── One-line context strip: where it goes + the knobs, inline ───────────
-    std::string preview =
+    const char* preview =
         g_st.genTarget == -1 ? "current editor" :
         g_st.genTarget == -2 ? "new level"      :
         (g_st.genTarget < (int)g_st.levels.size()
-            ? g_st.levels[g_st.genTarget].name
+            ? g_st.levels[g_st.genTarget].name.c_str()
             : "?");
     ImGui::TextColored(COL_DIM, "to");
     if (mobile) {
@@ -1705,7 +1769,7 @@ void composerBody(float dt) {
         ImGui::SameLine(0.f, 4.f);
         ImGui::SetNextItemWidth(150.f);
     }
-    if (ImGui::BeginCombo("##target", preview.c_str())) {
+    if (ImGui::BeginCombo("##target", preview)) {
         if (selectRow("current editor", g_st.genTarget == -1))
             g_st.genTarget = -1;
         if (selectRow("+ new level", g_st.genTarget == -2))
@@ -1736,18 +1800,23 @@ void composerBody(float dt) {
     // Live summary of the knobs, click to expand.
     static bool s_optionsOpen = false;
     {
+        // Stack buffer: the summary used to be built with fmt::format (plus
+        // two more formats for the same text as a button label) on every
+        // composer frame.
         std::string diff = editoraiGetStr("difficulty");
         std::string len  = editoraiGetStr("length");
         std::string sty  = editoraiGetStr("style");
-        std::string sum  = fmt::format("{} | {} | {}",
-            diff.empty() ? "?" : diff, len.empty() ? "?" : len,
-            sty == "levelID" ? "reference" : (sty.empty() ? "?" : sty));
+        char sum[384];
+        snprintf(sum, sizeof(sum), "%s | %s | %s",
+            diff.empty() ? "?" : diff.c_str(), len.empty() ? "?" : len.c_str(),
+            sty == "levelID" ? "reference" : (sty.empty() ? "?" : sty.c_str()));
+        char btnLabel[400];
+        snprintf(btnLabel, sizeof(btnLabel), "%s  %s",
+                 s_optionsOpen ? "v" : ">", sum);
         // Phones get a full-width row for the knobs (one clear tap target).
         bool toggled = mobile
-            ? ImGui::Button(fmt::format("{}  {}", s_optionsOpen ? "v" : ">",
-                                        sum).c_str(), ImVec2(-1.f, kTouchTarget))
-            : smallAction(fmt::format("{}  {}", s_optionsOpen ? "v" : ">",
-                                      sum).c_str());
+            ? ImGui::Button(btnLabel, ImVec2(-1.f, kTouchTarget))
+            : smallAction(btnLabel);
         if (toggled) s_optionsOpen = !s_optionsOpen;
         tipIfHovered("Difficulty, length and style. Click to change them.");
     }
@@ -2119,8 +2188,9 @@ void chatTabMobile(float dt) {
         for (int r = 1; r <= 10; ++r) {
             if (r > 1 && (r - 1) % 5 != 0) ImGui::SameLine();
             ImGui::PushID(900 + r);
-            if (ImGui::Button(std::to_string(r).c_str(),
-                              ImVec2(bw, kTouchTarget)))
+            char rLabel[4];
+            snprintf(rLabel, sizeof(rLabel), "%d", r);
+            if (ImGui::Button(rLabel, ImVec2(bw, kTouchTarget)))
                 editoraiRateSession(sel, r);
             ImGui::PopID();
         }
@@ -2382,8 +2452,9 @@ void tabSettings() {
         ImGui::TextColored(COL_DIM, "Changes apply live.");
         for (auto& s : THEME_SLOTS) {
             float col[3] = {s.col->x, s.col->y, s.col->z};
-            if (ImGui::ColorEdit3(fmt::format("{}##{}", s.label, s.key).c_str(),
-                    col, ImGuiColorEditFlags_DisplayRGB)) {
+            ImGui::PushID(s.key);
+            if (ImGui::ColorEdit3(s.label, col,
+                    ImGuiColorEditFlags_DisplayRGB)) {
                 *s.col = ImVec4(col[0], col[1], col[2], 1.f);
                 // Persist on every change: edits made inside the picker
                 // POPUP never fire IsItemDeactivatedAfterEdit on this row,
@@ -2391,6 +2462,7 @@ void tabSettings() {
                 // in-memory until Geode's save — per-change cost is nil.
                 editoraiSetSavedStr(s.key, vecToHex(*s.col));
             }
+            ImGui::PopID();
             tipIfHovered("Click the swatch for a picker, or drag the R/G/B "
                          "numbers like sliders.");
         }
@@ -2414,8 +2486,10 @@ void tabSettings() {
             // While capturing, the keyboard hook appends each key into
             // g_keyCapturePending; this UI shows progress and commits.
             if (!g_keyCapture) {
-                if (ImGui::Button(fmt::format("panel hotkey:  {}",
-                        keySeqDisplayName(overlayToggleSeq())).c_str())) {
+                char hotkeyLabel[96];
+                snprintf(hotkeyLabel, sizeof(hotkeyLabel), "panel hotkey:  %s",
+                         keySeqDisplayName(overlayToggleSeq()).c_str());
+                if (ImGui::Button(hotkeyLabel)) {
                     g_keyCapture = true;
                     g_keyCapturePending.clear();
                 }
@@ -2465,6 +2539,12 @@ void tabSettings() {
 // ── Main draw ─────────────────────────────────────────────────────────────────
 void drawOverlay() {
     float dt = ImGui::GetIO().DeltaTime;
+    // Drag-owner registrations are per-frame (a widget marks itself while it
+    // is being drawn; touchScroll consults the set later in the same frame).
+    // Clearing here keeps the set bounded instead of accumulating a hash
+    // entry for every distinct widget ID ever hovered — dynamic labels
+    // (buttons whose text embeds settings) mint new IDs as values change.
+    g_dragOwners.clear();
     if (!g_themeLoaded) loadTheme();
     if (!g_st.persistedLoaded) loadPersistedInputs();
     applyThemeFrame();
@@ -2686,13 +2766,14 @@ void drawOverlay() {
                 g_st.panelOpen = false;
             ImGui::PopStyleColor(2);
         } else {
-            std::string hint = fmt::format("{} hides",
-                                           keySeqDisplayName(overlayToggleSeq()));
-            float hw = ImGui::CalcTextSize(hint.c_str()).x;
+            char hint[96];
+            snprintf(hint, sizeof(hint), "%s hides",
+                     keySeqDisplayName(overlayToggleSeq()).c_str());
+            float hw = ImGui::CalcTextSize(hint).x;
             ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 20.f,
                                      ImGui::GetContentRegionMax().x - hw));
             ImGui::TextColored(ImVec4(COL_DIM.x, COL_DIM.y, COL_DIM.z, 0.65f),
-                               "%s", hint.c_str());
+                               "%s", hint);
         }
     }
 

@@ -177,7 +177,11 @@ std::vector<LocalLevelInfo> editoraiListLocalLevels();
 //   3 = have models       4 = fetch error
 // The URL follows the current Platinum/local toggle. Call the refresh function
 // to (re)fetch; it's a no-op while one is already in flight.
-int  editoraiGetOllamaModels(std::vector<std::string>& out);
+// Returns the cached model list by reference — the Settings tab asks for it
+// every frame, and copying the vector (plus every tag string) turned into a
+// per-frame allocation storm on phones. Geode delivers the fetch callback on
+// the main thread, so the reference cannot be replaced mid-frame.
+const std::vector<std::string>& editoraiGetOllamaModels(int& state);
 void editoraiRefreshOllamaModels();
 // Starts (or queues) a generation against the chosen target. Opens the
 // editor scene when needed; generation begins once the editor is ready.

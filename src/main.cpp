@@ -16628,10 +16628,13 @@ protected:
         bool          easOk      = false;
         matjson::Value easRoot;
         size_t        scriptChars = 0;
-        std::string   jsonBlock;             // empty when the reply had none
+        bool          jsonFound   = false;  // reply contained a JSON block
         bool          jsonOk      = false;
         matjson::Value jsonValue;
         int           fixesApplied = 0;
+        // NOTE: no copy of the raw JSON text is kept. It is a substring of a
+        // reply that is often hundreds of KB; the worker parses it and drops
+        // it, so the main-thread completion never holds text + tree at once.
     };
 
     // ── processFinalResponse ──────────────────────────────────────────────
@@ -16851,22 +16854,23 @@ protected:
                 // Brace-aware scan for the LAST balanced JSON object that is
                 // shaped like an EAI response; fall back to the outermost
                 // braces, which is what the old main-thread path did.
-                parsed.jsonBlock = extractLastEAIJsonBlock(response);
-                if (parsed.jsonBlock.empty()) {
+                std::string jsonBlock = extractLastEAIJsonBlock(response);
+                if (jsonBlock.empty()) {
                     size_t s = response.find('{');
                     size_t e = response.rfind('}');
                     if (s != std::string::npos && e != std::string::npos && e >= s)
-                        parsed.jsonBlock = response.substr(s, e - s + 1);
+                        jsonBlock = response.substr(s, e - s + 1);
                 }
-                if (!parsed.jsonBlock.empty()) {
-                    auto lenient = editorai::json_lenient::parse(parsed.jsonBlock);
+                parsed.jsonFound = !jsonBlock.empty();
+                if (parsed.jsonFound) {
+                    auto lenient = editorai::json_lenient::parse(jsonBlock);
                     if (lenient.ok) {
                         parsed.jsonOk       = true;
                         parsed.jsonValue    = std::move(lenient.value);
                         parsed.fixesApplied = lenient.fixesApplied;
                     }
                 }
-            }
+            }   // jsonBlock (a full copy of the script text) dies here
             Loader::get()->queueInMainThread(
                 [self = std::move(self), epoch,
                  response = std::move(response),
@@ -16928,7 +16932,7 @@ protected:
                 showStatus("Answered", false);
                 return true;
             };
-            if (parsed.jsonBlock.empty()) {
+            if (!parsed.jsonFound) {
                 // The worker found no balanced block and no usable brace pair.
                 if (wasCritiqueReply) {
                     // "ALL GOOD" (or any prose) — accept the level as-is.
@@ -20757,11 +20761,11 @@ void editoraiRefreshOllamaModels() {
         });
 }
 
-int editoraiGetOllamaModels(std::vector<std::string>& out) {
+const std::vector<std::string>& editoraiGetOllamaModels(int& state) {
     if (g_ollamaModelUrl != getOllamaUrl() + "/api/tags")
         editoraiRefreshOllamaModels();
-    out = g_ollamaModels;
-    return g_ollamaModelState;
+    state = g_ollamaModelState;
+    return g_ollamaModels;
 }
 
 std::vector<LocalLevelInfo> editoraiListLocalLevels() {
