@@ -15015,11 +15015,16 @@ protected:
     }
 
     void onToolRoundResponse(web::WebResponse resp) {
-        logApiResponse(resp.code(), resp.string().unwrapOr(""), m_requestLogId);
+        // Decode the body ONCE. It used to be materialized twice (logging and
+        // the error path) — a full UTF-8 copy of a response that can reach
+        // hundreds of KB, on the main thread.
+        std::string body = resp.string().unwrapOr("");
+        const int code = resp.code();
+        logApiResponse(code, body, m_requestLogId);
         if (!resp.ok()) {
-            if (this->retryToolRoundIfTransient(resp.code())) return;
+            if (this->retryToolRoundIfTransient(code)) return;
             auto [title, msg] = parseAPIError(
-                resp.string().unwrapOr("No body"), resp.code());
+                body.empty() ? "No body" : body, code);
             onError(title, msg);
             return;
         }
@@ -15028,18 +15033,37 @@ protected:
         // old single budget for the WHOLE loop meant a second 429/503 on a
         // long generation hard-errored.
         m_transientRetries = 0;
-        auto jsonRes = resp.json();
-        if (!jsonRes) {
-            onError("Tool Response",
-                fmt::format("The AI provider returned a response that isn't valid JSON. This usually "
-                            "means the provider is down, behind a captive portal, or your API key has "
-                            "been revoked. Check the provider's status page and re-test your key. ({})",
-                            autoErrorCode(60, 50)));
-            return;
-        }
-        auto json   = jsonRes.unwrap();
-        auto parsed = toolUse::parseResponse(m_toolProvider, json);
-        this->dispatchToolRound(std::move(parsed));
+
+        // JSON parse + provider extraction are pure but can be sizable (the
+        // first round carries the full system prompt), and this callback runs
+        // on the main thread. Do them on a worker and hand the result back,
+        // following the Ref-move-through pattern used by the retry path: a
+        // Ref copy must never be released off the main thread.
+        Ref<AIGeneratorPopup> self = this;
+        std::string provider = m_toolProvider;
+        std::thread([self = std::move(self), provider = std::move(provider),
+                     body = std::move(body)]() mutable {
+            matjson::Value json;
+            bool validJson = false;
+            auto jsonRes = matjson::parse(body);
+            if (jsonRes) { json = jsonRes.unwrap(); validJson = true; }
+            toolUse::ParsedResponse parsed;
+            if (validJson) parsed = toolUse::parseResponse(provider, json);
+            Loader::get()->queueInMainThread(
+                [self = std::move(self), parsed = std::move(parsed),
+                 validJson]() mutable {
+                    if (!self->m_isGenerating) return;   // cancelled meanwhile
+                    if (!validJson) {
+                        self->onError("Tool Response",
+                            fmt::format("The AI provider returned a response that isn't valid JSON. This usually "
+                                        "means the provider is down, behind a captive portal, or your API key has "
+                                        "been revoked. Check the provider's status page and re-test your key. ({})",
+                                        autoErrorCode(60, 50)));
+                        return;
+                    }
+                    self->dispatchToolRound(std::move(parsed));
+                });
+        }).detach();
     }
 
     // Everything after a tool round's response has been parsed.
@@ -18473,17 +18497,18 @@ protected:
 
     void onAPISuccess(web::WebResponse response, const std::string& provider) {
         const std::string responseBody = response.string().unwrapOr("");
-        logApiResponse(response.code(), responseBody, m_requestLogId);
+        const int code = response.code();
+        logApiResponse(code, responseBody, m_requestLogId);
         // Transient-failure retry runs BEFORE the UI reset so the loading
         // state survives the backoff.
         if (!response.ok()) {
-            if (this->retrySingleShotIfTransient(response.code(), "")) return;
+            if (this->retrySingleShotIfTransient(code, "")) return;
         }
 
         if (!response.ok()) {
             auto [title, message] = parseAPIError(
                 responseBody.empty() ? "No error details available" : responseBody,
-                response.code()
+                code
             );
             onError(title, message);
             return;
@@ -18491,8 +18516,9 @@ protected:
 
         // Older Platinum coordinators return a queue acknowledgement instead
         // of holding /api/generate open. It is not an Ollama answer yet.
-        if (provider == "ollama" &&
-            Mod::get()->getSettingValue<bool>("use-platinum")) {
+        const bool platinumOllama = provider == "ollama" &&
+            Mod::get()->getSettingValue<bool>("use-platinum");
+        if (platinumOllama) {
             matjson::Value queued;
             if (parseOllamaBody(responseBody, queued)) {
                 auto id = queued["request_id"].asString();
@@ -18507,34 +18533,50 @@ protected:
             }
         }
 
-        {
-            std::string aiResponse;
+        // Parse on a worker: a full generation response can be large (models
+        // often echo the level JSON) and this callback runs on the main
+        // thread. The parsed value is plain data; hand it back and run the
+        // provider-specific extraction on the main thread.
+        Ref<AIGeneratorPopup> self = this;
+        std::thread([self = std::move(self), provider = provider,
+                     body = responseBody, code, platinumOllama]() mutable {
             matjson::Value json;
             bool parsed = false;
-            auto jsonRes = response.json();
-            if (jsonRes) {
-                json = jsonRes.unwrap();
-                parsed = true;
-            } else if (provider == "ollama" &&
-                       Mod::get()->getSettingValue<bool>("use-platinum")) {
+            auto jsonRes = matjson::parse(body);
+            if (jsonRes) { json = jsonRes.unwrap(); parsed = true; }
+            else if (platinumOllama) {
                 // A newer coordinator may return buffered NDJSON from its
                 // long-poll path. Use the final valid line as the answer.
-                parsed = parseOllamaBody(responseBody, json);
+                parsed = AIGeneratorPopup::parseOllamaBody(body, json);
             }
-            if (!parsed) {
-                onError("Invalid Response",
-                    fmt::format("The provider returned data that didn't look like JSON at all. "
-                                "This is almost always a temporary upstream outage — try again "
-                                "in a minute, or switch providers in settings. ({})",
-                                autoErrorCode(60, 1)));
-                return;
-            }
+            Loader::get()->queueInMainThread(
+                [self = std::move(self), json = std::move(json), parsed,
+                 provider = std::move(provider), code]() mutable {
+                    if (!self->m_isGenerating) return;   // cancelled meanwhile
+                    self->onAPIJson(code, std::move(json), provider, parsed);
+                });
+        }).detach();
+    }
 
-            if (provider == "ollama") {
-                handleOllamaPayload(json, response.code(), false);
-                return;
+    // Everything in onAPISuccess that needs the parsed body. Runs on the main
+    // thread (it touches the UI and the session).
+    void onAPIJson(int code, matjson::Value json,
+                   const std::string& provider, bool parsed) {
+        if (!parsed) {
+            onError("Invalid Response",
+                fmt::format("The provider returned data that didn't look like JSON at all. "
+                            "This is almost always a temporary upstream outage — try again "
+                            "in a minute, or switch providers in settings. ({})",
+                            autoErrorCode(60, 1)));
+            return;
+        }
 
-            } else if (provider == "gemini") {
+        std::string aiResponse;
+        if (provider == "ollama") {
+            handleOllamaPayload(json, code, false);
+            return;
+
+        } else if (provider == "gemini") {
                     // Check if the entire request was blocked before generation started.
                     if (json.contains("promptFeedback")) {
                         auto blockReasonResult = json["promptFeedback"]["blockReason"].asString();
@@ -18629,11 +18671,10 @@ protected:
                     aiResponse = textResult.unwrap();
                 }
 
-            // Final text in hand — hand off to the shared post-processing
-            // path (same logic the tool-use loop calls when its final answer
-            // is the model's plain-text JSON).
-            this->processFinalResponse(std::move(aiResponse), provider);
-        }
+        // Final text in hand — hand off to the shared post-processing
+        // path (same logic the tool-use loop calls when its final answer
+        // is the model's plain-text JSON).
+        this->processFinalResponse(std::move(aiResponse), provider);
     }
 
     void onError(const std::string& title, const std::string& message) {
