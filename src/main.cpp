@@ -3413,24 +3413,29 @@ inline Analysis analyzeFile(const std::string& path, const std::string& name) {
 }
 
 // Cached per-path analysis. GD sessions touch a handful of songs at most.
+// Main-thread only: both the synchronous lookup and the prefetch completion
+// insert here on the main thread, so a returned Analysis& can never be
+// invalidated by a rehash happening on a worker.
+static std::unordered_map<std::string, Analysis> s_songCache;
+static Analysis                                   s_songMissing;
+static std::set<std::string>                      s_songPrefetchInFlight;
+
 inline Analysis& analyzeLevelSong(GJGameLevel* level) {
-    static std::unordered_map<std::string, Analysis> cache;
-    static Analysis missing;
     std::string name;
     std::string path = songPathFor(level, name);
     if (path.empty()) {
-        missing = {};
-        missing.err = level && level->m_songID > 0
+        s_songMissing = {};
+        s_songMissing.err = level && level->m_songID > 0
             ? fmt::format("song {} isn't downloaded — play the level once or "
                           "download it in the song browser", level->m_songID)
             : "no song file found for this level";
-        missing.songName = name;
-        return missing;
+        s_songMissing.songName = name;
+        return s_songMissing;
     }
-    auto it = cache.find(path);
-    if (it == cache.end()) {
+    auto it = s_songCache.find(path);
+    if (it == s_songCache.end()) {
         log::info("songsync: analyzing '{}' ({})", name, path);
-        it = cache.emplace(path, analyzeFile(path, name)).first;
+        it = s_songCache.emplace(path, analyzeFile(path, name)).first;
         if (it->second.ok)
             log::info("songsync: '{}' bpm={:.1f} conf={:.2f} dur={:.0f}s",
                       name, it->second.bpm, it->second.confidence,
@@ -3439,6 +3444,35 @@ inline Analysis& analyzeLevelSong(GJGameLevel* level) {
             log::warn("songsync: '{}' failed: {}", name, it->second.err);
     }
     return it->second;
+}
+
+// Decode the current level's song on a worker so the first get_bpm /
+// get_waveform tool call doesn't pay for it mid-loop. The path resolution uses
+// cocos singletons and stays on the caller's (main) thread; only FMOD's
+// createSound/readData (thread-safe) and the DSP run off-thread. The result is
+// installed into the cache on the main thread, so cache mutation stays
+// single-threaded.
+inline void prefetchLevelSong(GJGameLevel* level) {
+    std::string name;
+    std::string path = songPathFor(level, name);
+    if (path.empty()) return;
+    if (s_songCache.count(path)) return;
+    if (!s_songPrefetchInFlight.insert(path).second) return;
+    std::thread([path, name]() mutable {
+        Analysis a = analyzeFile(path, name);
+        Loader::get()->queueInMainThread(
+            [path = std::move(path), a = std::move(a)]() mutable {
+                s_songPrefetchInFlight.erase(path);
+                if (s_songCache.count(path)) return;   // sync path won
+                if (a.ok)
+                    log::info("songsync: prefetched '{}' bpm={:.1f} conf={:.2f} dur={:.0f}s",
+                              a.songName, a.bpm, a.confidence, a.durationSec);
+                else
+                    log::warn("songsync: prefetch failed for '{}': {}",
+                              a.songName, a.err);
+                s_songCache.emplace(std::move(path), std::move(a));
+            });
+    }).detach();
 }
 
 } // namespace songsync
@@ -9867,16 +9901,50 @@ static bool s_sessionsDirty  = false;
 static int  s_sessionsNextId = 1;
 void editoraiMarkSessionsDirty() { s_sessionsDirty = true; }
 
+// sessions.json preload: the read + JSON parse run on a worker as soon as the
+// mod loads, so opening the panel for the first time doesn't parse the file on
+// a frame. Only the parse is off-thread — building GenSession objects stays on
+// the main thread (cocos level lookups, transcript caps). If the panel opens
+// before the worker finishes, loadPersistedSessions falls back to reading the
+// file synchronously, which is exactly the old behaviour.
+static std::mutex        s_sessionsPreloadMutex;
+static matjson::Value    s_sessionsPreloadValue;
+static std::atomic<bool> s_sessionsPreloadReady{false};
+static std::atomic<bool> s_sessionsPreloadStarted{false};
+
+static void startSessionPreload() {
+    if (s_sessionsPreloadStarted.exchange(true)) return;
+    auto path = Mod::get()->getSaveDir() / "sessions.json";
+    std::thread([path] {
+        auto read = geode::utils::file::readString(path);
+        matjson::Value parsed;
+        if (read) {
+            if (auto p = matjson::parse(read.unwrap()))
+                parsed = p.unwrap();
+        }
+        std::lock_guard lock(s_sessionsPreloadMutex);
+        s_sessionsPreloadValue = std::move(parsed);
+        s_sessionsPreloadReady = true;
+    }).detach();
+}
+
 // Load persisted sessions once, on first registry access. Restored sessions
 // are read-only history: the engine (in-flight network state, tool history)
 // can't be serialized, so anything that was live becomes Done with a note.
 static void loadPersistedSessions(std::vector<std::shared_ptr<GenSession>>& out) {
-    auto path = Mod::get()->getSaveDir() / "sessions.json";
-    auto read = geode::utils::file::readString(path);
-    if (!read) return;
-    auto parsed = matjson::parse(read.unwrap());
-    if (!parsed) return;
-    const auto arr = parsed.unwrap();
+    matjson::Value arr;
+    if (s_sessionsPreloadReady.load()) {
+        std::lock_guard lock(s_sessionsPreloadMutex);
+        arr = std::move(s_sessionsPreloadValue);
+    } else {
+        // Preload hasn't finished yet — pay for it here (rare path).
+        auto path = Mod::get()->getSaveDir() / "sessions.json";
+        auto read = geode::utils::file::readString(path);
+        if (!read) return;
+        auto parsed = matjson::parse(read.unwrap());
+        if (!parsed) return;
+        arr = parsed.unwrap();
+    }
     if (!arr.isArray()) return;
     // Keep the NEWEST 12 (sessions are stored oldest-first) — capping from
     // the front would discard the most recent conversations, the ones a user
@@ -9981,7 +10049,7 @@ std::vector<std::shared_ptr<GenSession>>& genSessions() {
     return s;
 }
 
-// Serialize on the caller, write on a detached thread (persistFeedback
+// Snapshot on the caller, dump + write on a detached thread (persistFeedback
 // pattern). Throttled by the dirty flag — the overlay ticks this every
 // few seconds and $on_mod(DataSaved) flushes on exit.
 void editoraiPersistSessionsIfDirty() {
@@ -10049,13 +10117,15 @@ void editoraiPersistSessionsIfDirty() {
     // file + rename so a crash or overlapping writer can't tear the file.
     static std::atomic<uint64_t> s_writeGen{0};
     uint64_t gen = ++s_writeGen;
-    std::string out = arr.dump(matjson::NO_INDENTATION);
-    std::thread([out = std::move(out), gen,
-                 path = Mod::get()->getSaveDir() / "sessions.json"] {
+    // dump() of a multi-hundred-KB transcript tree is real work; do it on the
+    // writer thread instead of the frame that marked the sessions dirty.
+    std::thread([arr = std::move(arr), gen,
+                 path = Mod::get()->getSaveDir() / "sessions.json"]() mutable {
         static std::mutex s_writeMutex;
         static uint64_t   s_lastWritten = 0;
         std::lock_guard<std::mutex> lock(s_writeMutex);
         if (gen <= s_lastWritten) return;  // a newer snapshot already landed
+        std::string out = arr.dump(matjson::NO_INDENTATION);
         auto tmp = path;
         tmp += ".tmp";
         auto res = geode::utils::file::writeString(tmp, out);
@@ -18126,6 +18196,12 @@ protected:
         m_isGenerating = true;
         ++m_genEpoch;
         ++m_ghostToken;   // a pending ghost from the previous draft is stale
+        // Start the song decode now so a later get_bpm / get_waveform tool
+        // call hits the cache instead of stalling a frame mid-loop.
+        songsync::prefetchLevelSong(
+            m_editorLayer ? m_editorLayer->m_level
+                          : (LevelEditorLayer::get() ? LevelEditorLayer::get()->m_level
+                                                     : nullptr));
         setFlowPhase("building context");
         m_transientRetries = 0;
         m_generateBtn->setVisible(false);
@@ -20547,6 +20623,10 @@ $on_mod(Loaded) {
     // loadFeedback() makes a concurrent first call from the main thread
     // simply wait instead of double-loading.
     std::thread([] { loadFeedback(); }).detach();
+
+    // sessions.json is parsed on a worker from here on; the first panel open
+    // only builds GenSession objects from the already-parsed tree.
+    startSessionPreload();
 
     s_bypassCharFilter = Mod::get()->getSettingValue<bool>("bypass-char-filter");
     s_bypassCharLimit  = Mod::get()->getSettingValue<bool>("bypass-char-limit");
