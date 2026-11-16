@@ -10141,6 +10141,11 @@ protected:
     // in fresh-generation mode (toggle off ⇒ clear level, with confirmation).
     bool                     m_shouldClearLevel = true;
     bool                     m_isGenerating     = false;
+    // Bumped on every generation start/cancel. Work queued from a worker
+    // (response parsing, playtest simulation) compares its captured epoch
+    // and drops itself when a newer turn has taken over.
+    uint64_t                 m_genEpoch        = 0;
+    uint64_t                 m_ghostToken      = 0;
     int                      m_transientRetries = 0;   // reset per generation
     std::string              m_lastCallPrompt;          // for transient retry
     std::string              m_lastCallKey;
@@ -10534,8 +10539,10 @@ protected:
         // off-scene targets paused, so its object-spawn selector never fires
         // while live placement is waiting for the next AI diff. Register it
         // directly with the scheduler so both visible and headless engines
-        // progressively materialize their queued objects.
-        scheduleAlways(schedule_selector(AIGeneratorPopup::updateObjectCreation), 0.05f);
+        // progressively materialize their queued objects. 60 Hz: the tick
+        // itself is budgeted (see updateObjectCreation), so more frequent,
+        // smaller batches smooth staging instead of lengthening frames.
+        scheduleAlways(schedule_selector(AIGeneratorPopup::updateObjectCreation), 1.f / 60.f);
         return true;
     }
 
@@ -10858,7 +10865,7 @@ protected:
         // callbacks survive through the session, so restore the matching
         // background ticks too; otherwise queue polling stops on close.
         if (m_isGenerating || m_isCreatingObjects)
-            scheduleAlways(schedule_selector(AIGeneratorPopup::updateObjectCreation), 0.05f);
+            scheduleAlways(schedule_selector(AIGeneratorPopup::updateObjectCreation), 1.f / 60.f);
         if (m_isGenerating)
             scheduleAlways(schedule_selector(AIGeneratorPopup::updateGenerationTimer), 1.f);
         if (!m_platinumRequestId.empty())
@@ -10881,6 +10888,7 @@ protected:
         m_toolListenerNG    = {};
         m_toolListenerWeb   = {};
         m_isGenerating = false;
+        ++m_genEpoch;   // drop any queued parse/finish continuation
         // Turn-scoped flags die with the turn — leaking them poisons the
         // next generation's gates (see startGeneration's reset block).
         m_followUpTurn    = false;
@@ -11654,7 +11662,7 @@ protected:
 
         // Rebuild a lightweight matjson array from the deferred slots (the
         // accumulator was moved out at final apply).
-        auto arr = matjson::Value::array();
+        auto arr = std::make_shared<matjson::Value>(matjson::Value::array());
         for (auto& d : m_deferredObjects) {
             auto o = matjson::Value::object();
             const matjson::Value& dataConst = d.data;
@@ -11665,11 +11673,31 @@ protected:
             o["y"] = (double)d.position.y;
             auto sc = dataConst["scale"].asDouble();
             if (sc) o["scale"] = sc.unwrap();
-            arr.push(std::move(o));
+            arr->push(std::move(o));
         }
-        auto sim = levelcheck::simulateCube(arr,
-            (float)Mod::get()->getSettingValue<int64_t>("ai-ground-y"));
+        // The cube bot sweeps every staged object, so run it on a worker: the
+        // frame that finishes staging should not also pay for the whole
+        // simulation. The ghost is cosmetic — a frame of delay is invisible.
+        float groundY = (float)Mod::get()->getSettingValue<int64_t>("ai-ground-y");
+        Ref<AIGeneratorPopup> self = this;
+        const uint64_t token = ++m_ghostToken;
+        std::thread([self = std::move(self), token, arr,
+                     groundY]() mutable {
+            auto sim = levelcheck::simulateCube(*arr, groundY);
+            Loader::get()->queueInMainThread(
+                [self = std::move(self), token, sim = std::move(sim)]() mutable {
+                    if (token != self->m_ghostToken) return;  // superseded
+                    self->applyPlaytestGhost(std::move(sim));
+                });
+        }).detach();
+    }
+
+    // Draws an already-computed playtest trajectory (main thread).
+    void applyPlaytestGhost(levelcheck::SimResult sim) {
         if (sim.path.size() < 2) return;
+        // The preview may have been denied/accepted while the sim ran.
+        if (!s_inPreviewMode || !revalidateEditor()) return;
+        if (!m_editorLayer->m_objectLayer) return;
 
         auto draw = CCDrawNode::create();
         constexpr ccColor4F PATH_COL  {0.25f, 0.9f, 0.35f, 0.55f};
@@ -11682,6 +11710,7 @@ protected:
         }
         draw->setZOrder(900);
         m_editorLayer->m_objectLayer->addChild(draw);
+        removePlaytestGhost();   // drop any older node that raced us in
         s_playtestGhost = draw;
         if (!sim.deaths.empty())
             log::info("Playtest ghost: {} death(s), first at X={:.0f}",
@@ -11720,8 +11749,9 @@ protected:
         m_isCreatingObjects = false;
 
         // Playtest ghost: run the cube bot over what was just staged and
-        // draw its trajectory on the editor (sub-millisecond — swept
-        // geometry, one pass per generation).
+        // draw its trajectory on the editor. The simulation itself runs on a
+        // worker (it sweeps every staged object), so finishing the spawn
+        // doesn't also pay for it; the ghost appears a frame or two later.
         this->drawPlaytestGhost();
 
         // Enter blueprint preview mode — ghost objects are placed,
@@ -11796,10 +11826,12 @@ protected:
         // Phones can stall for several ms per object, so placing the whole
         // configured batch regardless makes every editor frame hitch while a
         // live build streams in. Treat spawn-batch-size as a MAXIMUM and stop
-        // once this tick has used its budget; leftover objects simply roll
-        // into the next 50 ms tick. Desktop batches finish far inside the
-        // budget, so their behaviour is unchanged.
-        constexpr auto kSpawnTickBudget = std::chrono::milliseconds(8);
+        // once this tick has used its budget; leftover objects roll into the
+        // next tick. The tick runs at 60 Hz and the budget is ~1/5 of a
+        // 16.7 ms frame, so staging stays smooth without starving the queue
+        // (it still drains faster than the old 8 ms / 50 ms arrangement).
+        // Desktop batches finish far inside the budget: unchanged there.
+        constexpr auto kSpawnTickBudget = std::chrono::milliseconds(3);
         const auto spawnTickStart = std::chrono::steady_clock::now();
         for (int b = 0; b < m_spawnBatchSize && m_currentObjectIndex < m_deferredObjects.size(); ++b) {
             if (!spawnDeferredOne()) return;
@@ -16519,12 +16551,31 @@ protected:
         if (!m_isCreatingObjects) m_generateBtn->setEnabled(true);
     }
 
+    // Parsed form of a final AI response, produced on a worker thread so the
+    // completion frame never pays for the parse. Plain data only: matjson
+    // values and strings move cheaply.
+    struct FinalParse {
+        bool          easOk      = false;
+        matjson::Value easRoot;
+        size_t        scriptChars = 0;
+        std::string   jsonBlock;             // empty when the reply had none
+        bool          jsonOk      = false;
+        matjson::Value jsonValue;
+        int           fixesApplied = 0;
+    };
+
     // ── processFinalResponse ──────────────────────────────────────────────
     // The portion of onAPISuccess after aiResponse is in hand. Factored out so
     // the tool-use loop can call it once its loop completes.
     void processFinalResponse(std::string aiResponse, const std::string& provider) {
         setFlowPhase("validating draft");
         resetGenerationUI();
+        // The parse now completes on the next main-thread pump. Keep Generate
+        // disabled across that gap so a fast second tap cannot discard the
+        // response that is already being parsed.
+        if (m_generateBtn) m_generateBtn->setEnabled(false);
+        // Any continuation still queued from an older response is now stale.
+        const uint64_t epoch = ++m_genEpoch;
         // Self-critique replies may legitimately contain no level content
         // ("ALL GOOD") — that must fall through to apply, not error out.
         bool wasCritiqueReply = m_critiquePending;
@@ -16704,32 +16755,90 @@ protected:
                 pushSession(GenSession::Entry::Kind::Assistant, s_lastAINarration);
         }
 
-        // ── EAS auto-detect ─────────────────────────────────────────────
-        // First, try the EditorAI Script (EAS) line-based format. EAS is the
-        // PREFERRED format: more compact, harder for the AI to malform, and
-        // forces metadata to be emitted via the META verb. If the response
-        // contains "## Level Script" we use whatever follows; otherwise we
-        // sniff the first non-comment line for an EAS verb.
-        matjson::Value levelData;
-        bool parsedAsEAS = false;
-        {
-            std::string scriptBody = eas::extractScript(aiResponse);
-            if (eas::looksLikeEAS(scriptBody)) {
-                auto er = eas::parse(scriptBody);
-                if (er.ok) {
-                    levelData = std::move(er.root);
-                    parsedAsEAS = true;
-                    log::info("Parsed response as EAS ({} chars script body)", scriptBody.size());
+        // ── EAS / JSON parsing (off the main thread) ────────────────────
+        // Everything above (markers, reasoning, fences, narration) needs to
+        // stay on the main thread. The parse itself is pure, and for a large
+        // level it is one of the biggest single-frame costs of a generation:
+        // an EAS script turns tens of thousands of lines into a matjson tree.
+        // Hand the sanitized response to a worker and finish when it returns.
+        Ref<AIGeneratorPopup> self = this;
+        std::thread([self = std::move(self), epoch,
+                     response = std::move(aiResponse),
+                     wasCritiqueReply]() mutable {
+            FinalParse parsed;
+            {
+                std::string scriptBody = eas::extractScript(response);
+                if (eas::looksLikeEAS(scriptBody)) {
+                    auto er = eas::parse(scriptBody);
+                    if (er.ok) {
+                        parsed.easOk       = true;
+                        parsed.easRoot     = std::move(er.root);
+                        parsed.scriptChars = scriptBody.size();
+                    }
                 }
             }
+            if (!parsed.easOk) {
+                // Brace-aware scan for the LAST balanced JSON object that is
+                // shaped like an EAI response; fall back to the outermost
+                // braces, which is what the old main-thread path did.
+                parsed.jsonBlock = extractLastEAIJsonBlock(response);
+                if (parsed.jsonBlock.empty()) {
+                    size_t s = response.find('{');
+                    size_t e = response.rfind('}');
+                    if (s != std::string::npos && e != std::string::npos && e >= s)
+                        parsed.jsonBlock = response.substr(s, e - s + 1);
+                }
+                if (!parsed.jsonBlock.empty()) {
+                    auto lenient = editorai::json_lenient::parse(parsed.jsonBlock);
+                    if (lenient.ok) {
+                        parsed.jsonOk       = true;
+                        parsed.jsonValue    = std::move(lenient.value);
+                        parsed.fixesApplied = lenient.fixesApplied;
+                    }
+                }
+            }
+            Loader::get()->queueInMainThread(
+                [self = std::move(self), epoch,
+                 response = std::move(response),
+                 parsed = std::move(parsed),
+                 wasCritiqueReply]() mutable {
+                    if (epoch != self->m_genEpoch) return;  // newer turn began
+                    self->finishFinalResponse(std::move(response),
+                                              std::move(parsed),
+                                              wasCritiqueReply);
+                });
+        }).detach();
+    }
+
+    // Second half of processFinalResponse: everything that needs the parsed
+    // level. Runs on the main thread (UI, session, apply).
+    void finishFinalResponse(std::string aiResponse, FinalParse parsed,
+                             bool wasCritiqueReply) {
+        // Parse finished — restore the Generate button resetGenerationUI()
+        // turned on before the async gap (unless staging owns it).
+        if (m_generateBtn && !m_isCreatingObjects) m_generateBtn->setEnabled(true);
+
+        // ── EAS result ──────────────────────────────────────────────────
+        // EAS is the PREFERRED format: more compact, harder for the AI to
+        // malform, and forces metadata to be emitted via the META verb. The
+        // worker already tried whatever followed "## Level Script" (or the
+        // first non-comment line, when the marker is absent).
+        matjson::Value levelData;
+        bool parsedAsEAS = false;
+        if (parsed.easOk) {
+            levelData   = std::move(parsed.easRoot);
+            parsedAsEAS = true;
+            log::info("Parsed response as EAS ({} chars script body)",
+                      parsed.scriptChars);
         }
 
         if (!parsedAsEAS) {
             // ── JSON fallback ───────────────────────────────────────────
             // Some models — especially smaller ones via Ollama — emit narration
             // around the JSON, or a draft JSON followed by a final one, or even
-            // a stale tool-call payload. Scan brace-aware for the LAST balanced
-            // JSON object that's shaped like an EAI response, prefer that.
+            // a stale tool-call payload. The worker scanned brace-aware for the
+            // LAST balanced JSON object shaped like an EAI response, preferring
+            // that over the first one.
             // Plan/Chat-mode (and plain conversational) replies contain no
             // script — on follow-up turns that's success, not an error.
             // The narration capture above only fires when a script marker
@@ -16749,38 +16858,32 @@ protected:
                 showStatus("Answered", false);
                 return true;
             };
-            std::string jsonBlock = extractLastEAIJsonBlock(aiResponse);
-            if (jsonBlock.empty()) {
-                size_t s = aiResponse.find('{');
-                size_t e = aiResponse.rfind('}');
-                if (s == std::string::npos || e == std::string::npos || e < s) {
-                    if (wasCritiqueReply) {
-                        // "ALL GOOD" (or any prose) — accept the level as-is.
-                        log::info("Self-critique: no changes requested by the model");
-                        levelData = matjson::Value::object();
-                        goto critiquePassThrough;
-                    }
-                    // Both completion protocols explicitly allow a marker-only
-                    // reply. Earlier rounds already contain the authoritative
-                    // accumulated level, so an empty delta is valid here.
-                    if (m_accumulatedObjects.size() > 0 &&
-                        (m_refineDeclaredDone || m_liveBuildDeclaredDone)) {
-                        levelData = matjson::Value::object();
-                        goto critiquePassThrough;
-                    }
-                    if (finishProseTurn()) return;
-                    onError("Invalid Response",
-                        fmt::format("The AI's reply didn't contain a valid level (no EAS verbs and "
-                                    "no JSON object found). It probably refused or replied "
-                                    "conversationally. Re-generate, or rephrase the prompt to be more "
-                                    "concrete (\"make a 30s easy level with spikes\"). ({})",
-                                    autoErrorCode(60, 5)));
-                    return;
+            if (parsed.jsonBlock.empty()) {
+                // The worker found no balanced block and no usable brace pair.
+                if (wasCritiqueReply) {
+                    // "ALL GOOD" (or any prose) — accept the level as-is.
+                    log::info("Self-critique: no changes requested by the model");
+                    levelData = matjson::Value::object();
+                    goto critiquePassThrough;
                 }
-                jsonBlock = aiResponse.substr(s, e - s + 1);
+                // Both completion protocols explicitly allow a marker-only
+                // reply. Earlier rounds already contain the authoritative
+                // accumulated level, so an empty delta is valid here.
+                if (m_accumulatedObjects.size() > 0 &&
+                    (m_refineDeclaredDone || m_liveBuildDeclaredDone)) {
+                    levelData = matjson::Value::object();
+                    goto critiquePassThrough;
+                }
+                if (finishProseTurn()) return;
+                onError("Invalid Response",
+                    fmt::format("The AI's reply didn't contain a valid level (no EAS verbs and "
+                                "no JSON object found). It probably refused or replied "
+                                "conversationally. Re-generate, or rephrase the prompt to be more "
+                                "concrete (\"make a 30s easy level with spikes\"). ({})",
+                                autoErrorCode(60, 5)));
+                return;
             }
-            auto levelLenient = editorai::json_lenient::parse(jsonBlock);
-            if (!levelLenient.ok) {
+            if (!parsed.jsonOk) {
                 if (wasCritiqueReply) {
                     log::info("Self-critique: reply unparseable — accepting the level as-is");
                     levelData = matjson::Value::object();
@@ -16795,9 +16898,9 @@ protected:
                                 autoErrorCode(60, 6)));
                 return;
             }
-            levelData = std::move(levelLenient.value);
-            if (levelLenient.fixesApplied > 0) {
-                log::info("Level JSON: auto-fixed {} category(ies) of model mistakes", levelLenient.fixesApplied);
+            levelData = std::move(parsed.jsonValue);
+            if (parsed.fixesApplied > 0) {
+                log::info("Level JSON: auto-fixed {} category(ies) of model mistakes", parsed.fixesApplied);
             }
         }
 
@@ -18021,6 +18124,8 @@ protected:
         }
 
         m_isGenerating = true;
+        ++m_genEpoch;
+        ++m_ghostToken;   // a pending ghost from the previous draft is stale
         setFlowPhase("building context");
         m_transientRetries = 0;
         m_generateBtn->setVisible(false);
@@ -18290,6 +18395,7 @@ protected:
         m_lengthTarget = lengthTargetForSetting(
             Mod::get()->getSettingValue<std::string>("length"));
         m_isGenerating = true;
+        ++m_genEpoch;
         if (m_session) m_session->state = GenSession::State::Running;
 
         showStatus("Building from pasted output...");
@@ -18896,6 +19002,7 @@ public:
         m_followUpTurn       = true;
         m_followUpMode       = mode;
         m_isGenerating       = true;
+        ++m_genEpoch;
         m_transientRetries   = 0;
         m_toolIterations     = 0;        // fresh, unbounded round count this turn
         m_editEnforceRounds  = 0;
